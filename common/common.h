@@ -703,6 +703,12 @@ struct common_params {
     // the next task to arrive. -1 disables it (legacy write-on-reuse/shutdown only).
     int32_t slot_save_idle_seconds = 60;
     bool    slot_save_idle_seconds_set = false; // true once --slot-save-idle-seconds is given explicitly
+    // minimum seconds between automatic disk flushes of a slot's KV on task completion. At the end
+    // of each generated response, if this many seconds have elapsed since the slot's KV was last
+    // persisted to disk, auto_save_slot_if_useful is called. This bounds data loss on a crash to at
+    // most one interval of work without forcing a multi-GB write on every response. 0 = flush on
+    // every task completion (no interval gating). Default: 1800 (30 min). Requires --slot-save-auto.
+    int32_t slot_save_flush_interval_sec = 1800;
     std::string media_path; // path to directory for loading media files
 
     float slot_prompt_similarity = 0.1f;

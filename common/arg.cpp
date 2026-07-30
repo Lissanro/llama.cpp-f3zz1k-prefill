@@ -3623,6 +3623,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SLOT_SAVE_IDLE_SECONDS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--slot-save-flush-interval"}, "N",
+        string_format("minimum seconds between automatic disk flushes of a slot's KV on task completion; "
+                      "at the end of each generated response, if this many seconds have elapsed since the "
+                      "slot's KV was last persisted to disk, it is flushed (0 = flush on every completion, "
+                      "default: %d). Requires --slot-save-auto.", params.slot_save_flush_interval_sec),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--slot-save-flush-interval must be >= 0");
+            }
+            params.slot_save_flush_interval_sec = value;
+        }
+    ).set_env("LLAMA_ARG_SLOT_SAVE_FLUSH_INTERVAL").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--media-path"}, "PATH",
         "directory for loading local media files; files can be accessed via file:// URLs using relative paths (default: disabled)",
         [](common_params & params, const std::string & value) {

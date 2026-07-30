@@ -1036,6 +1036,14 @@ struct server_slot {
     bool truncated      = false;
     bool just_restored  = false; // set on disk slot-restore; one-shot, gates restored-slot KV reuse
 
+    // ggml_time_us() of the last time this slot's KV was persisted to disk by the auto disk cache
+    // (auto_save_slot_if_useful). -1 = never. Used by the periodic on-release flush
+    // (--slot-save-flush-interval) to avoid re-writing unchanged content more often than the
+    // configured interval. Stamped on every successful save and on the "already exists" index
+    // hit (so unchanged content does not re-trigger a write). NOT reset in reset() — it tracks
+    // physical disk state, which persists across task boundaries on the same slot.
+    int64_t last_disk_save_time = -1;
+
     // --- mid-prefill shared-context base save (Option A) ---
     // When > 0, this cold-prefilling slot is ARMED to whole-save the leading shared preamble
     // [0, ctx_save_pos) as a deduplicated base: ctx_save_pos is the block-aligned first-user
@@ -3251,7 +3259,11 @@ private:
                     // be suppressed by a longer snapshot the model can never restore. PART: an
                     // equal-or-longer snapshot already covers this prefix (it can rewind to it).
                     if ((full || n_swa_mem > 0) ? (c.n_tokens == toks.size()) : (c.n_tokens >= toks.size())) {
-                        return; // a usable snapshot for this exact prefix already exists
+                        // a usable snapshot for this exact prefix already exists on disk — the disk
+                        // is current for this slot's content, so stamp the flush timer so the periodic
+                        // on-release flush does not redundantly re-write it.
+                        slot.last_disk_save_time = ggml_time_us();
+                        return;
                     }
                 }
             }
@@ -3373,6 +3385,9 @@ private:
                               /*hi=*/ (int32_t) toks.size(),
                               full_hash, bhs, /*kb=*/ bhs.size() - 1, cur_fp,
                               /*media=*/ media, /*parent_id=*/ have_parent ? parent_id : 0);
+
+        // stamp the flush timer: the slot's KV is now on disk.
+        slot.last_disk_save_time = ggml_time_us();
     }
 
     // AUTO-SAVE (shutdown): persist every slot's warm KV on graceful terminate — the third
@@ -3857,6 +3872,26 @@ private:
 
             slot.callback_on_release = [this](int id_slot) {
                 queue_tasks.pop_deferred_task(id_slot);
+
+                // Periodic disk flush: at the end of each generated response, if the slot's KV
+                // was last persisted to disk more than --slot-save-flush-interval ago, flush it
+                // now. This is the only auto-save site that fires when no new task arrives to
+                // reassign the slot: without it, a slot that finishes generating and then sits idle
+                // is not persisted until the next request (or shutdown), so a crash in between loses
+                // the entire response. The callee's "already exists" check makes a redundant call
+                // (unchanged content) a cheap no-op, and last_disk_save_time (stamped on every save
+                // and on already-exists hits) bounds the write rate. 0 = flush on every completion.
+                if (auto_cache_enabled() && params_base.slot_save_flush_interval_sec >= 0) {
+                    server_slot * s = get_slot_by_id(id_slot);
+                    if (s) {
+                        const int64_t now = ggml_time_us();
+                        const int64_t interval_us =
+                            (int64_t) params_base.slot_save_flush_interval_sec * 1000000;
+                        if (s->last_disk_save_time < 0 || now - s->last_disk_save_time >= interval_us) {
+                            auto_save_slot_if_useful(*s);
+                        }
+                    }
+                }
             };
 
             slot.reset();
@@ -4181,14 +4216,20 @@ private:
         }
 
         if (ret) {
-            // Second auto-save site for when cache_idle_slots is OFF (the idle-flush path that calls
-            // idle-flush loop where the primary auto_save runs). Here get_available_slot just picked `ret`
-            // for a new task and `update_cache` signals its prior KV is about to be discarded, so we
-            // persist it before the prompt_save/prompt_load below overwrites it. Mutually exclusive
-            // with the primary site via !cache_idle_slots, so no double-save. Reads `update_cache`
-            // BEFORE the `&& prompt_cache` narrowing so disk save works without --cache-ram. The
-            // callee carries all correctness gates; `ret` is idle so this never stalls generation.
-            if (auto_cache_enabled() && !params_base.cache_idle_slots && update_cache) {
+            // Persist the slot's KV to disk BEFORE the in-memory prompt_cache potentially evicts it.
+            // get_available_slot just picked `ret` for a new task; `update_cache` signals its prior
+            // KV is about to be overwritten by prompt_save/prompt_load below. We must persist it to
+            // disk first so a prompt_cache eviction (RAM-only, via the --cache-ram limit) never loses
+            // data: every prompt_cache entry is guaranteed to have a disk copy.
+            //
+            // This runs REGARDLESS of cache_idle_slots. With cache_idle_slots=true and -np 1, the
+            // idle-slot-flush path (below) never reaches the single slot (it is already processing
+            // by the time that loop runs), so this is the ONLY site that persists the slot's KV to
+            // disk before it is overwritten. With multiple slots, the idle-slot-flush path handles
+            // the OTHER (still-idle) slots; the "already exists" index check in the callee makes a
+            // redundant call a cheap no-op. Reads `update_cache` BEFORE the `&& prompt_cache`
+            // narrowing so disk save works without --cache-ram.
+            if (auto_cache_enabled() && update_cache) {
                 auto_save_slot_if_useful(*ret);
             }
 
