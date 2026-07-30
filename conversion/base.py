@@ -1491,6 +1491,9 @@ class TextModel(ModelBase):
         if chkhsh == "0fe1cf6eda062318a1af7270f3331a85c539a01778ff948e24388e949c5282f4":
             # ref: https://huggingface.co/evilfreelancer/ruGPT3XL
             res = "gpt-2"
+        if chkhsh == "6990f1358c92b6cef7c08ef650117ed3617d123618eaac0fc8e0be73a880aa52":
+            # ref: https://huggingface.co/moonshotai/Kimi-K2.5
+            res = "kimi-k25"
         if chkhsh == "9e454714343b69b99b71795c1d27a68c2a1d15dab111f4d353109f966af29da7":
             # ref: https://huggingface.co/LiquidAI/LFM2.5-8B-A1B
             res = "lfm2"
