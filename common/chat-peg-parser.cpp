@@ -340,6 +340,19 @@ void common_chat_peg_mapper::map(const common_peg_ast_node & node) {
     bool is_arg_name         = node.tag == common_chat_peg_builder::TOOL_ARG_NAME;
     bool is_arg_value        = node.tag == common_chat_peg_builder::TOOL_ARG_VALUE;
     bool is_arg_string_value = node.tag == common_chat_peg_builder::TOOL_ARG_STRING_VALUE;
+    bool is_section_start    = node.tag == common_chat_peg_builder::TOOL_SECTION_START;
+    bool is_section_end      = node.tag == common_chat_peg_builder::TOOL_SECTION_END;
+    bool is_per_call_start   = node.tag == common_chat_peg_builder::TOOL_PER_CALL_START;
+    bool is_per_call_end     = node.tag == common_chat_peg_builder::TOOL_PER_CALL_END;
+
+    if (is_section_start) {
+        section_start_raw = std::string(node.text);
+        has_section_start = true;
+    }
+
+    if (is_per_call_start) {
+        per_call_start_raw = std::string(node.text);
+    }
 
     if (is_tool_open) {
         pending_tool_call     = common_chat_tool_call();
@@ -347,6 +360,27 @@ void common_chat_peg_mapper::map(const common_peg_ast_node & node) {
         arg_count             = 0;
         args_buffer.clear();
         closing_quote_pending = false;
+        raw_start             = node.start;
+        raw_end               = node.start;
+    }
+
+    // Track the exact span of the current tool call in the input text.
+    // We update raw_end with every tool-related node so that nested tags
+    // extend the span rather than being double-counted.
+    bool is_tool_related = is_tool_open || is_tool_id || is_tool_name || is_tool_args ||
+                           is_arg_open || is_arg_name || is_arg_value || is_arg_string_value ||
+                           is_arg_close || is_tool_close;
+    if (current_tool && is_tool_related) {
+        if (node.end > raw_end) {
+            raw_end = node.end;
+        }
+        // Update the running raw text for streaming diffs.
+        std::string prefix;
+        if (has_section_start && result.tool_calls.empty()) {
+            prefix += section_start_raw;
+        }
+        prefix += per_call_start_raw;
+        current_tool->raw = prefix + std::string(input.substr(raw_start, raw_end - raw_start));
     }
 
     if (is_tool_id && current_tool) {
@@ -454,6 +488,16 @@ void common_chat_peg_mapper::map(const common_peg_ast_node & node) {
             }
             pending_tool_call.reset();
         }
+    }
+
+    if (is_per_call_end && !result.tool_calls.empty()) {
+        // Append per-call end marker to the most recent completed tool call.
+        result.tool_calls.back().raw += std::string(node.text);
+    }
+
+    if (is_section_end && !result.tool_calls.empty()) {
+        // Append section end marker to the most recent completed tool call.
+        result.tool_calls.back().raw += std::string(node.text);
     }
 }
 

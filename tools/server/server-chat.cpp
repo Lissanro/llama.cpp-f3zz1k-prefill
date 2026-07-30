@@ -629,6 +629,9 @@ json server_chat_msg_diff_to_json_oaicompat(const common_chat_msg_diff & diff) {
             }
             tool_call["function"] = function;
         }
+        if (!diff.tool_call_delta.raw.empty()) {
+            tool_call["__raw"] = diff.tool_call_delta.raw;
+        }
         delta["tool_calls"] = json::array({ tool_call });
     }
     return delta;

@@ -1450,8 +1450,8 @@ json oaicompat_chat_params_parse(
             throw std::invalid_argument("All non-assistant messages must contain 'content'");
         }
         if (role == "assistant") {
-            if (!msg.contains("content") && !msg.contains("tool_calls") && !msg.contains("reasoning_content")) {
-                throw std::invalid_argument("Assistant message must contain either 'content', 'tool_calls', or 'reasoning_content'!");
+            if (!msg.contains("content") && !msg.contains("tool_calls") && !msg.contains("tool_calls_raw") && !msg.contains("reasoning_content")) {
+                throw std::invalid_argument("Assistant message must contain either 'content', 'tool_calls', 'tool_calls_raw', or 'reasoning_content'!");
             }
             if (!msg.contains("content")) {
                 continue; // avoid errors with no content
@@ -1588,13 +1588,33 @@ json oaicompat_chat_params_parse(
     int prefill_case = 0;  // 0 = no prefill, 1-4 = cases
     std::string prefill_reasoning_text;
     std::string prefill_content_text;
+    bool prefill_has_tool_calls = false;
+    std::string prefill_tool_calls_raw;
+    bool prefill_tool_calls_is_structured = false;
     
     // Check if prefill is actually requested before detecting prefill cases
     bool prefill_assistant_message = has_assistant_message_at_end && opt.prefill_assistant;
     
     if (prefill_assistant_message) {
         const auto& last_msg = inputs.messages.back();
-        
+        const auto& last_json_msg = messages.back();
+
+        // Check for explicit raw tool-call tokens or complete structured tool_calls
+        // in the trailing assistant message.  Tool calls always come at the end of
+        // the assistant message, after any reasoning/content.
+        bool has_tool_calls_raw_field = last_json_msg.contains("tool_calls_raw") &&
+                                        !last_json_msg.at("tool_calls_raw").is_null();
+        if (has_tool_calls_raw_field) {
+            prefill_has_tool_calls = true;
+            prefill_tool_calls_raw = last_json_msg.at("tool_calls_raw").get<std::string>();
+            SRV_INF("%s", "Detected raw tool_calls prefill");
+        } else if (!last_msg.tool_calls.empty()) {
+            // Structured tool_calls are allowed only for complete tool calls.
+            prefill_has_tool_calls = true;
+            prefill_tool_calls_is_structured = true;
+            SRV_INF("Detected structured tool_calls prefill (%zu calls)\n", last_msg.tool_calls.size());
+        }
+
         // Check if this is a reasoning prefill case
         // Reasoning prefill is detected when reasoning_content is present
         if (!last_msg.reasoning_content.empty()) {
@@ -1657,7 +1677,7 @@ json oaicompat_chat_params_parse(
         }
         
         // For ALL prefill cases, disable generation prompt since we're continuing an incomplete message
-        if (prefill_case != 0) {
+        if (prefill_case != 0 || prefill_has_tool_calls) {
             inputs.add_generation_prompt = false;
             // Reset continue_final_message to prevent upstream mechanism from interfering
             // The prefill patch handles assistant message continuation via build_prefill_tokens()
@@ -1688,13 +1708,145 @@ json oaicompat_chat_params_parse(
     // Apply chat template to the list of messages
     auto chat_params = common_chat_templates_apply(opt.tmpls.get(), inputs);
 
+    std::string assistant_prefix;
+    {
+        const std::string & thinking_start = chat_params.thinking_start_tag;
+        const std::string & gen_prompt     = chat_params.generation_prompt;
+        bool has_thinking    = !thinking_start.empty()
+                               && gen_prompt.find(thinking_start) != std::string::npos;
+        assistant_prefix = has_thinking
+            ? gen_prompt.substr(0, gen_prompt.find(thinking_start))
+            : gen_prompt;
+    }
+
+    // Serialize complete structured tool_calls to raw model-format text for prefill.
+    if (prefill_has_tool_calls && prefill_tool_calls_is_structured) {
+        std::string raw = common_chat_tool_calls_to_text(last_message.tool_calls, chat_params);
+        if (!raw.empty()) {
+            prefill_tool_calls_raw = raw;
+        } else {
+            SRV_WRN("Failed to serialize structured tool_calls to raw text; tool format mode=%d\n",
+                    chat_params.tool_format_mode);
+            prefill_has_tool_calls = false;
+        }
+    }
+
+    // If the raw tool-call prefill does not end at a tool-call boundary, treat it as
+    // partial.  The tool-call grammar is built for generated text that starts fresh, so
+    // it would force the model to regenerate the prefix.  Disable the grammar for partial
+    // raw prefill and let the model continue the raw tokens; the PEG parser will extract
+    // the completed tool call(s) afterwards.
+    bool prefill_tool_calls_partial = false;
+    if (prefill_has_tool_calls && !prefill_tool_calls_raw.empty() && !prefill_tool_calls_is_structured) {
+        const auto & raw = prefill_tool_calls_raw;
+        bool ends_at_call_boundary = false;
+        if (!chat_params.tool_per_call_end.empty()) {
+            ends_at_call_boundary = raw.size() >= chat_params.tool_per_call_end.size()
+                && raw.compare(raw.size() - chat_params.tool_per_call_end.size(),
+                               chat_params.tool_per_call_end.size(),
+                               chat_params.tool_per_call_end) == 0;
+        } else if (!chat_params.tool_section_end.empty()) {
+            ends_at_call_boundary = raw.size() >= chat_params.tool_section_end.size()
+                && raw.compare(raw.size() - chat_params.tool_section_end.size(),
+                               chat_params.tool_section_end.size(),
+                               chat_params.tool_section_end) == 0;
+        } else if (chat_params.tool_format_mode == 1) {
+            // JSON_NATIVE: raw prefill should be valid JSON if complete.
+            try {
+                auto j = json::parse(raw);
+                ends_at_call_boundary = j.is_array();
+            } catch (...) {
+                ends_at_call_boundary = false;
+            }
+        } else {
+            // No clear boundary markers; conservatively assume complete.
+            ends_at_call_boundary = true;
+        }
+        prefill_tool_calls_partial = !ends_at_call_boundary;
+        if (prefill_tool_calls_partial) {
+            SRV_INF("%s", "Detected partial tool_calls_raw prefill; disabling tool-call grammar");
+            chat_params.grammar.clear();
+            chat_params.grammar_lazy = false;
+            chat_params.grammar_triggers.clear();
+        }
+    }
 
     // Pass prefill data to slot for ALL prefill cases (cases 1-4)
-    if (prefill_case != 0) {
+    if (prefill_case != 0 || prefill_has_tool_calls) {
         llama_params["__prefill_has_reasoning"] = prefill_with_reasoning;
         llama_params["__prefill_reasoning"] = prefill_reasoning_text;
         llama_params["__prefill_content"] = prefill_content_text;
         llama_params["__prefill_case"] = prefill_case;
+        llama_params["__prefill_is_continuation"] = true;
+        llama_params["__prefill_has_tool_calls"] = prefill_has_tool_calls;
+        llama_params["__prefill_tool_calls_raw"] = prefill_tool_calls_raw;
+        llama_params["__prefill_tool_calls_partial"] = prefill_tool_calls_partial;
+        llama_params["__prefill_assistant_prefix"] = assistant_prefix;
+        if (prefill_tool_calls_is_structured) {
+            llama_params["__prefill_tool_calls_structured"] = common_chat_msgs_to_json_oaicompat({last_message}, false).at(0).at("tool_calls");
+        }
+    }
+
+    // For prefill cases, construct a generation_prompt for the PEG parser that includes
+    // the prefilled reasoning/content.  This allows common_chat_parse() to see
+    // prefill_text + generated_text and correctly parse reasoning, content, AND tool
+    // calls (instead of the old manual splitting that bypassed the parser).
+    //
+    // The PEG parser prepends chat_parser_params.generation_prompt to the generated
+    // text and parses the result.  By setting it to the prefill text, the parser
+    // sees the full assistant turn (prefill + generation) and extracts tool calls.
+    //
+    // We also set is_continuation=true so task_result_state initialises chat_msg
+    // with the parsed prefill, making streaming diffs exclude the prefill.
+    std::string generation_prompt_for_parser = chat_params.generation_prompt;
+    if (prefill_case != 0 || prefill_has_tool_calls) {
+        const std::string & thinking_start = chat_params.thinking_start_tag;
+        // The codebase stores end tags as a vector (thinking_end_tags); use the first
+        // one to close the reasoning block for prefill construction.
+        const std::string   thinking_end   = chat_params.thinking_end_tags.empty()
+                                              ? "" : chat_params.thinking_end_tags.front();
+        const std::string & gen_prompt     = chat_params.generation_prompt;
+
+        // If the generation_prompt already includes the thinking start tag (has_thinking),
+        // we append to gen_prompt; otherwise we must insert thinking_start ourselves.
+        bool has_thinking    = !thinking_start.empty()
+                               && gen_prompt.find(thinking_start) != std::string::npos;
+        std::string thinking_start_suffix = has_thinking ? "" : thinking_start;
+
+        // Tool-call-only prefill: no reasoning/content case, just raw tool tokens
+        // appended after the assistant prefix.
+        if (prefill_case == 0 && prefill_has_tool_calls) {
+            generation_prompt_for_parser = assistant_prefix + prefill_tool_calls_raw;
+        }
+
+        switch (prefill_case) {
+            case 1: // reasoning only — keep reasoning block open
+                generation_prompt_for_parser = gen_prompt + thinking_start_suffix + prefill_reasoning_text;
+                break;
+            case 2: // reasoning + content — close reasoning, continue content
+                generation_prompt_for_parser = gen_prompt + thinking_start_suffix + prefill_reasoning_text
+                                              + thinking_end + prefill_content_text;
+                break;
+            case 3: // content only — no reasoning block
+                generation_prompt_for_parser = assistant_prefix + prefill_content_text;
+                break;
+            case 4: // reasoning + empty content — close reasoning, generate content
+                generation_prompt_for_parser = gen_prompt + thinking_start_suffix + prefill_reasoning_text
+                                              + thinking_end;
+                break;
+            default:
+                break;
+        }
+
+        // Append raw tool-call tokens at the end of the assistant prefill.
+        // If the reasoning block was left open (case 1), close it first.
+        // For tool-call-only prefill (case 0) the raw tokens are already included above.
+        if (prefill_has_tool_calls && prefill_case != 0) {
+            if (prefill_case == 1) {
+                generation_prompt_for_parser += thinking_end;
+            }
+            generation_prompt_for_parser += prefill_tool_calls_raw;
+        }
     }
 
     llama_params["chat_format"] = static_cast<int>(chat_params.format);
@@ -1711,7 +1863,7 @@ json oaicompat_chat_params_parse(
     }
     llama_params["grammar_triggers"]  = grammar_triggers;
     llama_params["preserved_tokens"]  = chat_params.preserved_tokens;
-    llama_params["generation_prompt"] = chat_params.generation_prompt;
+    llama_params["generation_prompt"] = generation_prompt_for_parser;
     for (const auto & stop : chat_params.additional_stops) {
         llama_params["stop"].push_back(stop);
     }

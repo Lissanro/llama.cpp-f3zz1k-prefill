@@ -156,6 +156,7 @@ task_result_state::task_result_state(const common_chat_parser_params & chat_pars
     if (chat_parser_params.is_continuation && !chat_parser_params.echo) {
         // initialize chat_msg to avoid emitting a delta containing the assistant prefill
         chat_msg = common_chat_parse("", true, chat_parser_params);
+        prefill_tool_calls_count = chat_msg.tool_calls.size();
     }
 }
 
@@ -166,78 +167,18 @@ common_chat_msg task_result_state::update_chat_msg(
         bool filter_tool_calls) {
     generated_text += text_added;
     auto msg_prv_copy = chat_msg;
-    
-    common_chat_msg new_msg;
-    
-    // Handle different prefill cases:
-    // Case 0: No prefill - use normal parsing
-    // Case 1: reasoning_content only (content null/missing) - open reasoning block
-    //         Use closing sequence to split reasoning from content
-    // Case 2: reasoning_content + non-empty content - closed reasoning, continue message
-    //         Generated text is pure content (no reasoning tags)
-    // Case 3: content only (no reasoning_content) - regular assistant content prefill
-    //         Generated text is pure content
-    // Case 4: reasoning_content + empty content string - closed reasoning, generate message
-    //         Generated text is pure content (no reasoning tags)
-    
-    if (prefill_case == 1 && !prefill_closing_sequence.empty()) {
-        // Case 1: Use closing sequence to split reasoning from content directly
-        size_t close_pos = generated_text.find(prefill_closing_sequence);
-        SRV_DBG("Looking for closing sequence in generated text. close_pos=%zu, closing_seq='%s', generated_text='%s'\n",
-                close_pos, prefill_closing_sequence.c_str(), generated_text.c_str());
-        
-        std::string reasoning_text;
-        std::string content_text;
-        
-        if (close_pos != std::string::npos) {
-            // Found closing sequence - split raw text
-            reasoning_text = generated_text.substr(0, close_pos);
-            content_text = generated_text.substr(close_pos + prefill_closing_sequence.length());
-            SRV_DBG("Split raw text at closing sequence. Reasoning len: %zu, Content len: %zu\n",
-                    reasoning_text.length(), content_text.length());
-        } else {
-            // Closing sequence not found yet - all generated text is reasoning
-            reasoning_text = generated_text;
-            content_text.clear();
-            SRV_DBG("Closing sequence not found, treating all as reasoning. len=%zu\n", reasoning_text.length());
-        }
-        
-        // Build message directly without parsing
-        // Strip any trailing closing sequence from reasoning (it marks transition to content)
-        // The prefill_closing_sequence may be multi-token, so check for partial matches
-        if (!prefill_closing_sequence.empty()) {
-            // Check if reasoning_text ends with any suffix of prefill_closing_sequence
-            // This handles partial generation of the closing sequence
-            for (size_t i = 1; i <= prefill_closing_sequence.size() && i <= reasoning_text.size(); ++i) {
-                std::string suffix = prefill_closing_sequence.substr(0, i);
-                if (reasoning_text.size() >= suffix.size()) {
-                    size_t pos = reasoning_text.size() - suffix.size();
-                    if (reasoning_text.compare(pos, suffix.size(), suffix) == 0) {
-                        reasoning_text.resize(pos);
-                        break;
-                    }
-                }
-            }
-        }
-        new_msg.role = "assistant";
-        new_msg.reasoning_content = reasoning_text;
-        new_msg.content = content_text;
-    } else if (prefill_case == 2 || prefill_case == 3 || prefill_case == 4) {
-        // Cases 2, 3, 4: Generated text is pure content (no reasoning tags to parse)
-        // The reasoning block was already closed in prefill, model just generates content
-        SRV_DBG("Prefill case %d: treating generated text as pure content: %s\n", prefill_case, generated_text.c_str());
-        new_msg.content = generated_text;
-        new_msg.role = "assistant";
-        // Note: reasoning_content stays empty since the model is generating content,
-        // not reasoning. The prefilled reasoning is handled separately in to_json_oaicompat_chat()
-    } else {
-        // Case 0 (no prefill): Use normal parsing
-        SRV_DBG("Parsing chat message (prefill_case=%d): %s\n", prefill_case, generated_text.c_str());
-        new_msg = common_chat_parse(
-            generated_text,
-            is_partial,
-            chat_parser_params);
-    }
+
+    // For all cases (including prefill cases 1-4), use common_chat_parse.
+    // For prefill cases, chat_parser_params.generation_prompt is set to the prefill
+    // text (constructed in oaicompat_chat_params_parse), so common_chat_parse sees
+    // prefill_text + generated_text and correctly parses reasoning, content, AND
+    // tool calls.  This fixes the bug where tool calls were emitted as raw text
+    // instead of structured tool_calls when return_prefill was used.
+    SRV_DBG("Parsing chat message (prefill_case=%d): %s\n", prefill_case, generated_text.c_str());
+    common_chat_msg new_msg = common_chat_parse(
+        generated_text,
+        is_partial,
+        chat_parser_params);
     
     if (!new_msg.empty()) {
         new_msg.set_tool_call_ids(generated_tool_call_ids, gen_tool_call_id);
@@ -258,6 +199,7 @@ common_chat_msg task_result_state::update_chat_msg(
                         header.tool_call_index      = i;
                         header.tool_call_delta.id   = chat_msg.tool_calls[i].id;
                         header.tool_call_delta.name = chat_msg.tool_calls[i].name;
+                        header.tool_call_delta.raw  = chat_msg.tool_calls[i].raw;
                         diffs.push_back(std::move(header));
                         sent_tool_call_names.insert(i);
                     }
@@ -294,6 +236,7 @@ common_chat_msg task_result_state::update_chat_msg(
                         header.tool_call_index      = i;
                         header.tool_call_delta.id   = chat_msg.tool_calls[i].id;
                         header.tool_call_delta.name = chat_msg.tool_calls[i].name;
+                        header.tool_call_delta.raw  = chat_msg.tool_calls[i].raw;
                         diffs.push_back(std::move(header));
                         sent_tool_call_names.insert(i);
                     }
@@ -517,24 +460,9 @@ json server_task_result_cmpl_final::to_json_oaicompat_chat() {
         msg.content = content;
     }
     
-    // If return_prefill is true, prepend the prefilled content to the message
-    // This is done AFTER parsing so the parser only works with newly generated content
-    if (return_prefill && prefill_case > 0) {
-        // For reasoning cases (1, 2, 4), prepend prefilled reasoning
-        if (!prefill_reasoning_content.empty()) {
-            // Only prepend if not already present
-            if (msg.reasoning_content.empty() || msg.reasoning_content.find(prefill_reasoning_content) != 0) {
-                msg.reasoning_content = prefill_reasoning_content + msg.reasoning_content;
-            }
-        }
-        // For content cases (2, 3), prepend prefilled content
-        if (!prefill_content.empty()) {
-            // Only prepend if not already present
-            if (msg.content.empty() || msg.content.find(prefill_content) != 0) {
-                msg.content = prefill_content + msg.content;
-            }
-        }
-    }
+    // Note: prefill handling is done in update() — when return_prefill is false the
+    // prefill is stripped from oaicompat_msg there; when true it is already included
+    // because is_continuation=true makes common_chat_parse process prefill+generated.
     if (stop == STOP_TYPE_WORD || stop == STOP_TYPE_EOS) {
         finish_reason = msg.tool_calls.empty() ? "stop" : "tool_calls";
     }
@@ -1103,42 +1031,40 @@ json server_task_result_cmpl_final::to_json_anthropic_stream() {
 void server_task_result_cmpl_partial::update(task_result_state & state) {
     is_updated = true;
     // Pass prefill state to the state object before parsing
-    copy_prefill_state_to_result(state, prefill_case, prefill_opening_sequence, prefill_closing_sequence,
-                                 prefill_reasoning_content, prefill_content, return_prefill);
+    copy_prefill_state_to_result(state, prefill_case, prefill_reasoning_content, prefill_content, return_prefill,
+                                 prefill_has_tool_calls, prefill_tool_calls_partial, prefill_tool_calls_raw, prefill_tool_calls_structured);
     if (is_begin) {
         return; // begin marker only flushes headers, skip parsing
     }
     state.update_chat_msg(content, true, oaicompat_msg_diffs);
 
-    // If return_prefill is true and this is the first chunk, prepend prefilled content to the diffs
-    // This ensures the streaming response includes the prefilled content
-    if (return_prefill && prefill_case > 0 && n_decoded == 1) {
-        // Prepend prefilled reasoning content to the first reasoning diff
+    // With is_continuation=true (set for prefill cases), the initial chat_msg includes
+    // the parsed prefill, so diffs naturally exclude the prefill.  When return_prefill
+    // is true we must emit the prefill as a synthetic first delta so the streaming
+    // client receives it.
+    if (return_prefill && n_decoded == 1 && (prefill_case > 0 || prefill_has_tool_calls)) {
+        std::vector<common_chat_msg_diff> prefill_diffs;
         if (!prefill_reasoning_content.empty()) {
-            bool found_reasoning_diff = false;
-            for (auto & diff : oaicompat_msg_diffs) {
-                if (!diff.reasoning_content_delta.empty()) {
-                    diff.reasoning_content_delta = prefill_reasoning_content + diff.reasoning_content_delta;
-                    found_reasoning_diff = true;
-                    break;
-                }
-            }
-            // If no reasoning diff exists (e.g., Case 2 where model generates only content),
-            // create one with the prefilled reasoning
-            if (!found_reasoning_diff) {
-                common_chat_msg_diff prefill_diff;
-                prefill_diff.reasoning_content_delta = prefill_reasoning_content;
-                oaicompat_msg_diffs.insert(oaicompat_msg_diffs.begin(), prefill_diff);
+            common_chat_msg_diff d;
+            d.reasoning_content_delta = prefill_reasoning_content;
+            prefill_diffs.push_back(std::move(d));
+        }
+        if (!prefill_content.empty()) {
+            common_chat_msg_diff d;
+            d.content_delta = prefill_content;
+            prefill_diffs.push_back(std::move(d));
+        }
+        if (prefill_has_tool_calls && !prefill_tool_calls_structured.empty()) {
+            for (size_t i = 0; i < prefill_tool_calls_structured.size(); ++i) {
+                common_chat_msg_diff d;
+                d.tool_call_index = i;
+                d.tool_call_delta = prefill_tool_calls_structured[i];
+                prefill_diffs.push_back(std::move(d));
             }
         }
-        // Prepend prefilled content to the first content diff
-        if (!prefill_content.empty()) {
-            for (auto & diff : oaicompat_msg_diffs) {
-                if (!diff.content_delta.empty()) {
-                    diff.content_delta = prefill_content + diff.content_delta;
-                    break;
-                }
-            }
+        if (!prefill_diffs.empty()) {
+            oaicompat_msg_diffs.insert(oaicompat_msg_diffs.begin(),
+                                       prefill_diffs.begin(), prefill_diffs.end());
         }
     }
 

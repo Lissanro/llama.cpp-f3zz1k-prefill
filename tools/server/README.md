@@ -14,7 +14,7 @@ Set of LLM REST APIs and a web UI to interact with llama.cpp.
  * Multimodal ([documentation](../../docs/multimodal.md)) / with OpenAI-compatible API support
  * Monitoring endpoints
  * Schema-constrained JSON response format
- * Prefilling of assistant messages similar to the Claude API
+ * [Prefilling of assistant messages](../../docs/prefill-continuation.md) similar to the Claude API
  * [Function calling](../../docs/function-calling.md) / tool use for ~any model
  * Speculative decoding
  * Easy-to-use web UI

@@ -10,8 +10,9 @@
 class common_chat_peg_mapper {
   public:
     common_chat_msg & result;
+    const std::string & input;
 
-    common_chat_peg_mapper(common_chat_msg & msg) : result(msg) {}
+    common_chat_peg_mapper(common_chat_msg & msg, const std::string & input) : result(msg), input(input) {}
 
     virtual ~common_chat_peg_mapper() = default;
 
@@ -26,6 +27,11 @@ class common_chat_peg_mapper {
       int                                  arg_count             = 0;
       bool                                 closing_quote_pending = false;
       std::string                          args_buffer;  // Buffer to delay arguments until tool name is known
+      size_t                               raw_start = 0;     // Start position of current tool call in input
+      size_t                               raw_end   = 0;     // End position of current tool call in input
+      std::string                          section_start_raw; // Raw text of section start marker
+      bool                                 has_section_start = false;
+      std::string                          per_call_start_raw; // Raw text of per-call start marker
 
       // Returns a reference to the active argument destination string.
       // Before tool_name is known, writes go to args_buffer; after, to current_tool->arguments.
@@ -34,7 +40,7 @@ class common_chat_peg_mapper {
 
 class common_chat_peg_gemma4_mapper : public common_chat_peg_mapper {
   public:
-    common_chat_peg_gemma4_mapper(common_chat_msg & msg) : common_chat_peg_mapper(msg) {}
+    common_chat_peg_gemma4_mapper(common_chat_msg & msg, const std::string & input) : common_chat_peg_mapper(msg, input) {}
     virtual void from_ast(const common_peg_ast_arena & arena, const common_peg_parse_result & result);
   private:
     void visit(const common_peg_ast_arena & arena, common_peg_ast_id id);
@@ -46,7 +52,7 @@ class common_chat_peg_minimax_m3_mapper : public common_chat_peg_mapper {
     static constexpr const char * TOOL_ARG_ARRAY  = "tool-arg-array";
     static constexpr const char * TOOL_ARG_ITEM   = "tool-arg-item";
 
-    common_chat_peg_minimax_m3_mapper(common_chat_msg & msg) : common_chat_peg_mapper(msg) {}
+    common_chat_peg_minimax_m3_mapper(common_chat_msg & msg, const std::string & input) : common_chat_peg_mapper(msg, input) {}
     virtual void from_ast(const common_peg_ast_arena & arena, const common_peg_parse_result & result);
   private:
     void visit(const common_peg_ast_arena & arena, common_peg_ast_id id);
@@ -77,6 +83,10 @@ class common_chat_peg_builder : public common_peg_parser_builder {
     static constexpr const char * TOOL_ARG_NAME         = "tool-arg-name";
     static constexpr const char * TOOL_ARG_VALUE        = "tool-arg-value";
     static constexpr const char * TOOL_ARG_STRING_VALUE = "tool-arg-string-value";  // For schema-declared string types
+    static constexpr const char * TOOL_SECTION_START    = "tool-section-start";
+    static constexpr const char * TOOL_SECTION_END      = "tool-section-end";
+    static constexpr const char * TOOL_PER_CALL_START   = "tool-per-call-start";
+    static constexpr const char * TOOL_PER_CALL_END     = "tool-per-call-end";
 
     // Low-level tag methods (from former common_chat_peg_base_builder)
     common_peg_parser reasoning_block(const common_peg_parser & p) { return tag(REASONING_BLOCK, p); }
@@ -105,6 +115,11 @@ class common_chat_peg_builder : public common_peg_parser_builder {
     // Use for schema-declared string types - won't be treated as potential JSON container
     common_peg_parser tool_arg_string_value(const common_peg_parser & p) { return tag(TOOL_ARG_STRING_VALUE, p); }
     common_peg_parser tool_arg_json_value(const common_peg_parser & p) { return tag(TOOL_ARG_VALUE, p); }
+
+    common_peg_parser tool_section_start(const common_peg_parser & p) { return atomic(tag(TOOL_SECTION_START, p)); }
+    common_peg_parser tool_section_end(const common_peg_parser & p)   { return atomic(tag(TOOL_SECTION_END, p)); }
+    common_peg_parser tool_per_call_start(const common_peg_parser & p) { return atomic(tag(TOOL_PER_CALL_START, p)); }
+    common_peg_parser tool_per_call_end(const common_peg_parser & p)   { return atomic(tag(TOOL_PER_CALL_END, p)); }
 
 
     // Matches every parser exactly once, in any order.

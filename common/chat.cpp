@@ -252,6 +252,9 @@ json common_chat_msg::to_json_oaicompat(bool concat_typed_text) const {
             if (!tool_call.id.empty()) {
                 tc["id"] = tool_call.id;
             }
+            if (!tool_call.raw.empty()) {
+                tc["__raw"] = tool_call.raw;
+            }
             // Some templates generate and require an id (sometimes in a very specific format, e.g. Mistral Nemo).
             // We only generate a random id for the ones that don't generate one by themselves
             // (they also won't get to see it as their template likely doesn't use it, so it's all for the client)
@@ -312,7 +315,8 @@ std::vector<common_chat_msg_diff> common_chat_msg_diff::compute_diffs(const comm
             }
         }
         const auto args_diff = string_diff(pref.arguments, newf.arguments);
-        if (!args_diff.empty() || pref.id != newf.id || pref.name != newf.name) {
+        const auto raw_diff  = string_diff(pref.raw, newf.raw);
+        if (!args_diff.empty() || !raw_diff.empty() || pref.id != newf.id || pref.name != newf.name) {
             auto & diff          = diffs.emplace_back();
             diff.tool_call_index = idx;
             if (pref.id != newf.id || pref.name != newf.name) {
@@ -320,6 +324,7 @@ std::vector<common_chat_msg_diff> common_chat_msg_diff::compute_diffs(const comm
                 diff.tool_call_delta.name = newf.name;
             }
             diff.tool_call_delta.arguments = args_diff;
+            diff.tool_call_delta.raw       = raw_diff;
         }
     }
     for (size_t idx = msg_prv.tool_calls.size(); idx < msg_new.tool_calls.size(); ++idx) {
@@ -390,6 +395,7 @@ std::vector<common_chat_msg> common_chat_msgs_parse_oaicompat(const json & messa
 
             auto has_content    = message.contains("content");
             auto has_tool_calls = message.contains("tool_calls");
+            auto has_tool_calls_raw = message.contains("tool_calls_raw");
             if (has_content) {
                 const auto & content = message.at("content");
                 if (content.is_string()) {
@@ -445,13 +451,16 @@ std::vector<common_chat_msg> common_chat_msgs_parse_oaicompat(const json & messa
                 }
             }
             auto has_reasoning_content = message.contains("reasoning_content") && !message.at("reasoning_content").is_null();
-            if (!has_content && !has_tool_calls && !has_reasoning_content) {
+            if (!has_content && !has_tool_calls && !has_tool_calls_raw && !has_reasoning_content) {
                 throw std::invalid_argument(
-                    "Expected 'content', 'tool_calls', or 'reasoning_content' (ref: https://github.com/ggml-org/llama.cpp/issues/8367 & "
+                    "Expected 'content', 'tool_calls', 'tool_calls_raw', or 'reasoning_content' (ref: https://github.com/ggml-org/llama.cpp/issues/8367 & "
                     "https://github.com/ggml-org/llama.cpp/issues/12279)");
             }
             if (message.contains("reasoning_content")) {
                 msg.reasoning_content = message.at("reasoning_content");
+            }
+            if (has_tool_calls_raw && !message.at("tool_calls_raw").is_null()) {
+                msg.tool_calls_raw = message.at("tool_calls_raw").get<std::string>();
             }
             if (message.contains("name")) {
                 msg.tool_name = message.at("name");
@@ -3481,6 +3490,35 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
                 auto_params.thinking_end_tags = {std::move(end_tag)};
             }
         }
+
+        // Populate tool format info for serializing tool_calls back to raw model text
+        // (used by the server for partial tool call prefill / continuation)
+        auto_params.tool_format_mode      = static_cast<int>(autoparser.tools.format.mode);
+        auto_params.tool_section_start    = autoparser.tools.format.section_start;
+        auto_params.tool_section_end      = autoparser.tools.format.section_end;
+        auto_params.tool_per_call_start   = autoparser.tools.format.per_call_start;
+        auto_params.tool_per_call_end     = autoparser.tools.format.per_call_end;
+        auto_params.tool_name_prefix      = autoparser.tools.function.name_prefix;
+        auto_params.tool_name_suffix      = autoparser.tools.function.name_suffix;
+        auto_params.tool_args_separator   = autoparser.tools.function.args_separator;
+        auto_params.tool_close            = autoparser.tools.function.close;
+        auto_params.tool_args_start       = autoparser.tools.arguments.start;
+        auto_params.tool_args_end         = autoparser.tools.arguments.end;
+        auto_params.tool_arg_name_prefix  = autoparser.tools.arguments.name_prefix;
+        auto_params.tool_arg_name_suffix  = autoparser.tools.arguments.name_suffix;
+        auto_params.tool_arg_value_prefix = autoparser.tools.arguments.value_prefix;
+        auto_params.tool_arg_value_suffix = autoparser.tools.arguments.value_suffix;
+        auto_params.tool_arg_separator    = autoparser.tools.arguments.separator;
+        auto_params.tool_fun_name_is_key  = autoparser.tools.format.fun_name_is_key;
+        auto_params.tool_tools_array_wrapped = autoparser.tools.format.tools_array_wrapped;
+        auto_params.tool_function_field   = autoparser.tools.format.function_field;
+        auto_params.tool_name_field       = autoparser.tools.format.name_field;
+        auto_params.tool_args_field       = autoparser.tools.format.args_field;
+        auto_params.tool_id_field         = autoparser.tools.format.id_field;
+        auto_params.tool_gen_id_field     = autoparser.tools.format.gen_id_field;
+        auto_params.tool_call_id_pos      = static_cast<int>(autoparser.tools.call_id.pos);
+        auto_params.tool_call_id_prefix   = autoparser.tools.call_id.prefix;
+        auto_params.tool_call_id_suffix   = autoparser.tools.call_id.suffix;
         common_peg_arena arena;
         arena.load(auto_params.parser);
         LOG_DBG("%s: generated parser:\n%s\n\nparser generation prompt: %s\n", __func__, arena.dump(arena.root()).c_str(), auto_params.generation_prompt.c_str());
@@ -3563,6 +3601,195 @@ common_chat_params common_chat_templates_apply(const struct common_chat_template
                               common_chat_templates_apply_legacy(tmpls, inputs);
 }
 
+// Serialize a single tool call to raw model-format text.
+// Handles JSON_NATIVE, TAG_WITH_JSON, and TAG_WITH_TAGGED formats.
+// For TAG_WITH_TAGGED, parses the JSON arguments and converts to parameter tags.
+// For partial JSON arguments, outputs as much as can be determined.
+static std::string serialize_tool_call(const common_chat_tool_call & tc, const common_chat_params & params) {
+    std::string result;
+    const auto & fmt = params;
+
+    // Call ID section (position-dependent)
+    std::string call_id_section;
+    if (!tc.id.empty() && !fmt.tool_call_id_prefix.empty()) {
+        call_id_section = fmt.tool_call_id_prefix + tc.id;
+        if (!fmt.tool_call_id_suffix.empty()) {
+            call_id_section += fmt.tool_call_id_suffix;
+        }
+    }
+
+    // Build function name part
+    std::string name_part = fmt.tool_name_prefix + tc.name + fmt.tool_name_suffix;
+
+    // Build arguments part
+    std::string args_part;
+    if (fmt.tool_format_mode == 3) { // TAG_WITH_TAGGED
+        // Parse arguments JSON and convert to parameter tags
+        args_part = fmt.tool_args_start;
+        if (!tc.arguments.empty()) {
+            try {
+                auto args_json = json::parse(tc.arguments);
+                bool first = true;
+                for (auto it = args_json.begin(); it != args_json.end(); ++it) {
+                    if (!first && !fmt.tool_arg_separator.empty()) {
+                        args_part += fmt.tool_arg_separator;
+                    }
+                    first = false;
+                    args_part += fmt.tool_arg_name_prefix + it.key() + fmt.tool_arg_name_suffix;
+                    args_part += fmt.tool_arg_value_prefix;
+                    if (it.value().is_string()) {
+                        args_part += it.value().get<std::string>();
+                    } else {
+                        args_part += it.value().dump();
+                    }
+                    args_part += fmt.tool_arg_value_suffix;
+                }
+            } catch (const std::exception & e) {
+                // Partial JSON: try to extract key-value pairs manually
+                // Look for the last "key": "value" or "key": value pattern
+                std::string args = tc.arguments;
+                // Try to find complete key-value pairs
+                size_t pos = 0;
+                bool first = true;
+                while (pos < args.size()) {
+                    // Find opening quote of key
+                    size_t key_start = args.find('"', pos);
+                    if (key_start == std::string::npos) break;
+                    size_t key_end = args.find('"', key_start + 1);
+                    if (key_end == std::string::npos) break;
+                    // Find colon after key
+                    size_t colon = args.find(':', key_end);
+                    if (colon == std::string::npos) break;
+                    // Skip whitespace after colon
+                    size_t val_start = colon + 1;
+                    while (val_start < args.size() && std::isspace(args[val_start])) val_start++;
+                    if (val_start >= args.size()) break;
+                    std::string key = args.substr(key_start + 1, key_end - key_start - 1);
+                    if (!first && !fmt.tool_arg_separator.empty()) {
+                        args_part += fmt.tool_arg_separator;
+                    }
+                    first = false;
+                    args_part += fmt.tool_arg_name_prefix + key + fmt.tool_arg_name_suffix;
+                    args_part += fmt.tool_arg_value_prefix;
+                    if (args[val_start] == '"') {
+                        // String value
+                        size_t val_end = args.find('"', val_start + 1);
+                        if (val_end == std::string::npos) {
+                            // Incomplete string value - output what we have
+                            args_part += args.substr(val_start + 1);
+                            // Don't add value_suffix since the value is incomplete
+                            break;
+                        }
+                        args_part += args.substr(val_start + 1, val_end - val_start - 1);
+                        args_part += fmt.tool_arg_value_suffix;
+                        pos = val_end + 1;
+                    } else {
+                        // Non-string value - find end (comma or closing brace)
+                        size_t val_end = args.find_first_of(",}", val_start);
+                        if (val_end == std::string::npos) {
+                            // Incomplete value
+                            args_part += args.substr(val_start);
+                            break;
+                        }
+                        args_part += args.substr(val_start, val_end - val_start);
+                        args_part += fmt.tool_arg_value_suffix;
+                        pos = val_end;
+                    }
+                }
+            }
+        }
+        args_part += fmt.tool_args_end;
+    } else {
+        // JSON_NATIVE or TAG_WITH_JSON: arguments are JSON, output as-is
+        args_part = tc.arguments;
+    }
+
+    // Assemble the tool call based on format mode
+    if (fmt.tool_format_mode == 1) { // JSON_NATIVE
+        if (fmt.tool_fun_name_is_key) {
+            // Function name is a JSON key: {"NAME": {...}}
+            result = std::string("{") + "\"" + tc.name + "\":" + args_part + "}";
+        } else {
+            // Standard: {"name": "NAME", "arguments": ARGS}
+            result = "{";
+            if (!fmt.tool_function_field.empty()) {
+                result += "\"" + fmt.tool_function_field + "\":{";
+            }
+            result += "\"" + fmt.tool_name_field + "\":\"" + tc.name + "\",";
+            result += "\"" + fmt.tool_args_field + "\":" + args_part;
+            if (!fmt.tool_function_field.empty()) {
+                result += "}";
+            }
+            if (!fmt.tool_id_field.empty() && !tc.id.empty()) {
+                result += ",\"" + fmt.tool_id_field + "\":\"" + tc.id + "\"";
+            }
+            result += "}";
+        }
+    } else { // TAG_WITH_JSON or TAG_WITH_TAGGED
+        // Call ID before function name
+        if (fmt.tool_call_id_pos == 1 && !call_id_section.empty()) {
+            result += call_id_section;
+        }
+        result += name_part;
+        // Args separator between name and args
+        if (!fmt.tool_args_separator.empty()) {
+            result += fmt.tool_args_separator;
+        }
+        // Call ID between function name and arguments
+        if (fmt.tool_call_id_pos == 2 && !call_id_section.empty()) {
+            result += call_id_section;
+        }
+        result += args_part;
+        // Call ID after arguments
+        if (fmt.tool_call_id_pos == 3 && !call_id_section.empty()) {
+            result += call_id_section;
+        }
+        // Close tag
+        if (!fmt.tool_close.empty()) {
+            result += fmt.tool_close;
+        }
+    }
+
+    return result;
+}
+
+std::string common_chat_tool_calls_to_text(const std::vector<common_chat_tool_call> & tool_calls,
+                                            const common_chat_params & params) {
+    if (tool_calls.empty() || params.tool_format_mode == 0) {
+        return "";
+    }
+
+    std::string result;
+
+    // Section start
+    if (!params.tool_section_start.empty()) {
+        result += params.tool_section_start;
+    }
+
+    for (size_t i = 0; i < tool_calls.size(); i++) {
+        if (i > 0 && !params.tool_per_call_start.empty()) {
+            // Per-call separator (usually newline or space)
+            result += "\n";
+        }
+        // Per-call start
+        if (!params.tool_per_call_start.empty()) {
+            result += params.tool_per_call_start;
+        }
+        result += serialize_tool_call(tool_calls[i], params);
+        // Per-call end
+        if (!params.tool_per_call_end.empty()) {
+            result += params.tool_per_call_end;
+        }
+    }
+
+    // Section end
+    if (!params.tool_section_end.empty()) {
+        result += params.tool_section_end;
+    }
+
+    return result;
+}
+
 common_chat_msg common_chat_parse(const std::string &               input,
                                   bool                              is_partial,
                                   const common_chat_parser_params & params) {
@@ -3604,11 +3831,11 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
             msg.role = "assistant";
             std::unique_ptr<common_chat_peg_mapper> mapper;
             if (params.format == COMMON_CHAT_FORMAT_PEG_GEMMA4) {
-                mapper = std::make_unique<common_chat_peg_gemma4_mapper>(msg);
+                mapper = std::make_unique<common_chat_peg_gemma4_mapper>(msg, effective_input);
             } else if (params.format == COMMON_CHAT_FORMAT_PEG_MINIMAX_M3) {
-                mapper = std::make_unique<common_chat_peg_minimax_m3_mapper>(msg);
+                mapper = std::make_unique<common_chat_peg_minimax_m3_mapper>(msg, effective_input);
             } else {
-                mapper = std::make_unique<common_chat_peg_mapper>(msg);
+                mapper = std::make_unique<common_chat_peg_mapper>(msg, effective_input);
             }
             mapper->from_ast(ctx.ast, result);
 
@@ -3628,11 +3855,11 @@ common_chat_msg common_chat_peg_parse(const common_peg_arena &          src_pars
 
     std::unique_ptr<common_chat_peg_mapper> mapper;
     if (params.format == COMMON_CHAT_FORMAT_PEG_GEMMA4) {
-        mapper = std::make_unique<common_chat_peg_gemma4_mapper>(msg);
+        mapper = std::make_unique<common_chat_peg_gemma4_mapper>(msg, effective_input);
     } else if (params.format == COMMON_CHAT_FORMAT_PEG_MINIMAX_M3) {
-        mapper = std::make_unique<common_chat_peg_minimax_m3_mapper>(msg);
+        mapper = std::make_unique<common_chat_peg_minimax_m3_mapper>(msg, effective_input);
     } else {
-        mapper = std::make_unique<common_chat_peg_mapper>(msg);
+        mapper = std::make_unique<common_chat_peg_mapper>(msg, effective_input);
     }
     mapper->from_ast(ctx.ast, result);
 

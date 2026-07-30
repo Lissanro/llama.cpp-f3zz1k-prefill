@@ -3,6 +3,9 @@
 [chat.h](../common/chat.h) (https://github.com/ggml-org/llama.cpp/pull/9639) adds support for [OpenAI-style function calling](https://platform.openai.com/docs/guides/function-calling) and is used in:
 - `llama-server` when started w/ `--jinja` flag
 
+For resuming an interrupted assistant message that contains tool calls, see
+[Prefill / continuation](prefill-continuation.md).
+
 ## Universal support w/ Native & Generic handlers
 
 Function calling is supported for all models (see https://github.com/ggml-org/llama.cpp/pull/9639):

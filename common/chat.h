@@ -29,9 +29,10 @@ struct common_chat_tool_call {
     std::string name;
     std::string arguments;
     std::string id;
+    std::string raw;   // exact raw model-format text for this tool call
 
     bool operator==(const common_chat_tool_call & other) const {
-        return name == other.name && arguments == other.arguments && id == other.id;
+        return name == other.name && arguments == other.arguments && id == other.id && raw == other.raw;
     }
 };
 
@@ -86,6 +87,7 @@ struct common_chat_msg {
     std::string                               reasoning_content;
     std::string                               tool_name;
     std::string                               tool_call_id;
+    std::string                               tool_calls_raw;   // raw model-format tool tokens for prefill
 
     nlohmann::ordered_json to_json_oaicompat(bool concat_typed_text = false) const;
 
@@ -295,6 +297,36 @@ struct common_chat_params {
     std::vector<std::string>            additional_stops;
     std::string                         parser;
     common_chat_msg_delimiters          message_delimiters;
+
+       // Tool call format info for serializing tool_calls back to raw model text.
+    // Populated by the auto-parser from template analysis; used by the server
+    // to reconstruct raw tool-call tokens for prefill (partial tool call continuation).
+       int  tool_format_mode = 0;  // 0=NONE, 1=JSON_NATIVE, 2=TAG_WITH_JSON, 3=TAG_WITH_TAGGED
+    std::string tool_section_start;
+    std::string tool_section_end;
+    std::string tool_per_call_start;
+    std::string tool_per_call_end;
+    std::string tool_name_prefix;     // e.g. "<function=", "\"name\": \""
+    std::string tool_name_suffix;     // e.g. ">", "\""
+    std::string tool_args_separator;  // marker between function name and arguments
+    std::string tool_close;           // e.g. "</function>"
+    std::string tool_args_start;      // e.g. "<args>"
+    std::string tool_args_end;        // e.g. "</args>"
+    std::string tool_arg_name_prefix; // e.g. "<param=", "\""
+    std::string tool_arg_name_suffix; // e.g. ">", "\":"
+    std::string tool_arg_value_prefix;// e.g. ""
+    std::string tool_arg_value_suffix;// e.g. "</param>"
+    std::string tool_arg_separator;   // e.g. "\n", ","
+    bool tool_fun_name_is_key = false;
+    bool tool_tools_array_wrapped = false;
+    std::string tool_function_field;  // e.g. "function"
+    std::string tool_name_field;      // e.g. "name"
+    std::string tool_args_field;      // e.g. "arguments"
+    std::string tool_id_field;
+    std::string tool_gen_id_field;
+    int  tool_call_id_pos = 0;  // 0=NONE, 1=PRE_FUNC_NAME, 2=BETWEEN_FUNC_AND_ARGS, 3=POST_ARGS
+    std::string tool_call_id_prefix;
+    std::string tool_call_id_suffix;
 };
 
 // per-message parsing syntax
@@ -354,6 +386,12 @@ std::string common_chat_format_example(const struct common_chat_templates *     
 const char *    common_chat_format_name(common_chat_format format);
 common_chat_msg common_chat_parse(const std::string & input, bool is_partial, const common_chat_parser_params & params);
 common_chat_msg common_chat_peg_parse(const common_peg_arena & src_parser, const std::string & input, bool is_partial, const common_chat_parser_params & params);
+
+// Serialize tool_calls back to raw model-format text using tool format info from common_chat_params.
+// Used for partial tool call prefill / continuation.
+// Returns empty string if tool format is NONE or tool_calls is empty.
+std::string common_chat_tool_calls_to_text(const std::vector<common_chat_tool_call> & tool_calls,
+                                            const common_chat_params & params);
 
 // used by arg and server
 const char *            common_reasoning_format_name(common_reasoning_format format);

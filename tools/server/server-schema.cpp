@@ -327,6 +327,15 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
             ctx.params.chat_parser_params.is_continuation = continuation != COMMON_CHAT_CONTINUATION_NONE;
         }));
 
+    // Set by the prefill path in oaicompat_chat_params_parse so that the PEG parser
+    // initialises chat_msg with the parsed prefill (streaming diffs exclude the prefill).
+    add((new field_json("__prefill_is_continuation"))
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            if (data.at("__prefill_is_continuation").get<bool>()) {
+                ctx.params.chat_parser_params.is_continuation = true;
+            }
+        }));
+
     add((new field_bool("echo", params.chat_parser_params.echo))
         ->set_desc("Whether to echo the input tokens in the output"));
 
