@@ -1710,6 +1710,15 @@ size_t server_prompt_cache::n_tokens() const {
 }
 
 server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
+    // Every entry inserted here comes from a server_slot::prompt_save call that is preceded by
+    // auto_save_slot_if_useful (at both call sites in server-context.cpp), so a disk snapshot +
+    // index entry already exist for it. The evictions below (obsolete-contained erasure, oldest-
+    // pop for size, bad_alloc shrink) therefore only drop the RAM copy; the durable disk copy
+    // persists and stays indexed. The sole exceptions are sub-floor prefixes (below
+    // --slot-save-min-tokens) that auto_save deliberately skips as not worth a multi-GB write.
+    // Any new prompt_save call site must preserve this ordering (auto_save first) to keep RAM
+    // eviction lossless.
+
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {
         const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);

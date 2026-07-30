@@ -4237,6 +4237,17 @@ private:
             if (slot.prompt.n_tokens() > 0) {
                 SRV_WRN("purging slot %d with %zu tokens\n", slot.id, slot.prompt.tokens.size());
 
+                // Persist the slot's KV to disk before dropping it from VRAM. Without this a
+                // KV-pressure purge is the one path that silently destroys a resident state with
+                // no disk copy: the slot was idle (not reassigned, so the get_available_slot
+                // save site did not run for it) and may not have reached a periodic/flush interval
+                // yet, so its warm KV exists only in VRAM. auto_save_slot_if_useful is a no-op
+                // when a snapshot already covers this prefix (dedup) or the prefix is below the
+                // save floor, so the common case (already persisted) costs only an index check.
+                if (auto_cache_enabled()) {
+                    auto_save_slot_if_useful(slot);
+                }
+
                 slot.prompt_clear();
 
                 res = true;
@@ -6674,6 +6685,24 @@ private:
 
                         slot.n_prompt_tokens_cache = n_past;
                         slot.n_prompt_tokens_processed = 0;
+
+                        // Persist the slot's full pre-truncation state to disk before keep_first
+                        // below (and the seq_rm after it) discard the divergent tail [n_past,
+                        // old_end). The get_available_slot save site only fires when update_cache is
+                        // set (f_keep < 0.5 or an LRU pick); a branch point with f_keep in
+                        // [0.5, 1.0) reuses the slot (update_cache == false) so its old full state is
+                        // never saved there, and the tail is about to be lost forever. A pure
+                        // extension (f_keep == 1.0, n_past == old length) has no tail, so this is a
+                        // no-op for the common growing-conversation turn. The callee's dedup makes it
+                        // a cheap no-op whenever the state was already persisted (get_available_slot,
+                        // idle flush, or periodic flush), so it only writes for the genuinely-unsaved
+                        // branch. Placed before keep_first so the saved token stream and KV still
+                        // describe the full old state; after an auto_restore the slot's tokens equal
+                        // the restored snapshot (n_past == n_tokens) so this is skipped, and the
+                        // restore-continue fast path returns above before reaching here.
+                        if (auto_cache_enabled() && n_past < (int) slot.prompt.tokens.size()) {
+                            auto_save_slot_if_useful(slot);
+                        }
 
                         slot.prompt.tokens.keep_first(n_past);
 
