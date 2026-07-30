@@ -1015,6 +1015,17 @@ struct server_slot {
     std::string  debug_generated_text;
     llama_tokens generated_tokens;
 
+    // Prefill state
+    bool has_prefill = false;
+    bool return_prefill = false;
+    int32_t prefill_case = 0;  // 0 = no prefill, 1-4 = prefill cases
+    std::string prefill_reasoning_content;
+    std::string prefill_content;
+    llama_tokens prefill_tokens;
+    size_t prefill_idx = 0;
+    std::string prefill_opening_sequence;
+    std::string prefill_closing_sequence;  // Closing tag for reasoning block (extracted from template)
+
     std::vector<completion_token_output> generated_token_probs;
 
     bool has_next_token = true;
@@ -1162,6 +1173,16 @@ struct server_slot {
         n_draft_accepted = 0;
         n_draft_verif_steps = 0;
         n_accepted_per_pos.clear();
+
+        // Reset prefill state
+        has_prefill = false;
+        prefill_case = 0;
+        prefill_reasoning_content.clear();
+        prefill_content.clear();
+        prefill_tokens.clear();
+        prefill_idx = 0;
+        prefill_opening_sequence.clear();
+        prefill_closing_sequence.clear();
 
         task_prev = std::move(task);
         task.reset();
@@ -4007,6 +4028,7 @@ private:
             chat_params = {
                 /* use_jinja             */ params_base.use_jinja,
                 /* prefill_assistant     */ params_base.prefill_assistant,
+                /* return_prefill        */ params_base.return_prefill,
                 /* reasoning_format      */ params_base.reasoning_format,
                 /* chat_template_kwargs  */ params_base.default_template_kwargs,
                 /* tmpls                 */ std::move(chat_templates),
@@ -4235,6 +4257,301 @@ private:
         return output;
     }
 
+    // Helper: Find a token sequence within another token sequence
+    // Returns the starting index if found, or std::string::npos if not found
+    static size_t find_token_sequence(const llama_tokens & haystack, const llama_tokens & needle) {
+        if (needle.empty() || haystack.size() < needle.size()) {
+            return std::string::npos;
+        }
+        for (size_t i = 0; i + needle.size() <= haystack.size(); ++i) {
+            bool match = true;
+            for (size_t j = 0; j < needle.size(); ++j) {
+                if (haystack[i + j] != needle[j]) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) {
+                return i;
+            }
+        }
+        return std::string::npos;
+    }
+
+    // Helper: Extract the assistant portion from formatted template output
+    // by subtracting the user portion from the combined output
+    static std::string extract_assistant_template(
+            const std::string & formatted_both,
+            const std::string & formatted_user) {
+        if (formatted_both.find(formatted_user) == 0) {
+            // User portion is at the start, return the remainder
+            return formatted_both.substr(formatted_user.length());
+        }
+        // Fallback: user portion not at start, return whole thing
+        // (shouldn't happen with standard templates)
+        SRV_WRN("Could not subtract user portion from template output, expected prefix: %s\n", formatted_user.c_str());
+        return formatted_both;
+    }
+
+    // FALLBACK HELPER: Inject reasoning placeholder between empty think tags
+    // This handles templates that output <|think_start|><|think_end|> without
+    // a reasoning placeholder when the thinking context is not properly passed.
+    // This is a temporary workaround that can be removed once the root cause
+    // (passing thinking context to templates) is fully resolved.
+    static void fallback_inject_reasoning_placeholder(
+            server_slot & slot,
+            std::string & formatted_with_placeholders,
+            const std::string & reasoning_placeholder) {
+        // Look for empty think tags: think><think (without angle brackets to avoid
+        // issues with special token syntax)
+        const std::string empty_think_start = "<think>";
+        const std::string think_end = "</think>";
+        
+        size_t think_start_pos = formatted_with_placeholders.find(empty_think_start);
+        if (think_start_pos != std::string::npos) {
+            size_t think_end_pos = formatted_with_placeholders.find(think_end, think_start_pos + empty_think_start.length());
+            if (think_end_pos != std::string::npos) {
+                // Found empty think tags, inject reasoning placeholder
+                std::string before = formatted_with_placeholders.substr(0, think_start_pos + empty_think_start.length());
+                std::string after = formatted_with_placeholders.substr(think_end_pos);
+                formatted_with_placeholders = before + reasoning_placeholder + after;
+                
+                SLT_WRN(slot, "%s", "FALLBACK: Injected reasoning placeholder between empty think tags.\n");
+            }
+        }
+    }
+
+    // Build prefill tokens for reasoning/content prefill cases.
+    // This function uses placeholder-based extraction to identify template structure
+    // and construct the correct token sequence for prefill scenarios.
+    //
+    // Prefill cases:
+    //   1: reasoning_content only (content is null/missing) -> open reasoning block
+    //   2: reasoning_content + non-empty content -> closed reasoning, continue message
+    //   3: content only (no reasoning_content) -> regular assistant content prefill
+    //   4: reasoning_content + empty content string -> closed reasoning, generate message
+    //
+    // Returns false if template parsing fails, true on success.
+    bool build_prefill_tokens(
+            server_slot & slot,
+            int32_t prefill_case,
+            bool prefill_with_reasoning,
+            const std::string & prefill_reasoning_content,
+            const std::string & prefill_content) {
+        // Use simple alphanumeric placeholders to avoid tokenization issues
+        // with special characters like %. Use distinct strings that don't overlap.
+        const std::string reasoning_placeholder = "REASONINGBLOCKPLACEHOLDER";
+        const std::string content_placeholder = "MESSAGECONTENTPLACEHOLDER";
+
+        // Create placeholder messages to extract template structure
+        common_chat_msg user_placeholder;
+        user_placeholder.role = "user";
+        user_placeholder.content = "USERPLACEHOLDER";
+
+        common_chat_msg assistant_placeholder;
+        assistant_placeholder.role = "assistant";
+        // For reasoning cases (1, 2, 4), set reasoning_content placeholder
+        if (prefill_with_reasoning) {
+            assistant_placeholder.reasoning_content = reasoning_placeholder;
+            SLT_DBG(slot, "Set reasoning_content placeholder: '%s'\n", reasoning_placeholder.c_str());
+        }
+        // Always set content placeholder: needed by case 1 to extract the closing sequence
+        // (tokens between reasoning and content placeholders), and by cases 2, 3, 4 for normal operation
+        assistant_placeholder.content = content_placeholder;
+        SLT_DBG(slot, "Set content placeholder: '%s'\n", content_placeholder.c_str());
+
+        // Format both messages together, then extract assistant portion
+        common_chat_templates_inputs tmpl_inputs_both;
+        tmpl_inputs_both.messages = {user_placeholder, assistant_placeholder};
+        tmpl_inputs_both.add_generation_prompt = false;
+        tmpl_inputs_both.use_jinja = true;
+        tmpl_inputs_both.enable_thinking = true;  // Enable to get reasoning block structure
+        // For Kimi K2.5 and similar templates, we need to explicitly pass thinking=true
+        // through chat_template_kwargs so the template includes reasoning_content
+        tmpl_inputs_both.chat_template_kwargs["thinking"] = "true";
+        // For prefill case 1 (reasoning_content only), force thinking_forced_open to true
+        // This handles templates that don't properly detect open reasoning blocks
+        if (prefill_case == 1) {
+            tmpl_inputs_both.force_thinking_open = true;
+        }
+
+        auto chat_params_both = common_chat_templates_apply(chat_params.tmpls.get(), tmpl_inputs_both);
+
+        // Format just the user message for subtraction
+        common_chat_templates_inputs tmpl_inputs_user;
+        tmpl_inputs_user.messages = {user_placeholder};
+        tmpl_inputs_user.add_generation_prompt = false;
+        tmpl_inputs_user.use_jinja = true;
+
+        auto chat_params_user = common_chat_templates_apply(chat_params.tmpls.get(), tmpl_inputs_user);
+
+        std::string formatted_with_placeholders = extract_assistant_template(
+            chat_params_both.prompt, chat_params_user.prompt);
+
+        // FALLBACK: Inject reasoning placeholder if template didn't render it
+        // Apply to both the extracted assistant portion AND the full prompt
+        fallback_inject_reasoning_placeholder(slot, formatted_with_placeholders, reasoning_placeholder);
+        fallback_inject_reasoning_placeholder(slot, chat_params_both.prompt, reasoning_placeholder);
+
+        SLT_DBG(slot, "Formatted template with placeholders (assistant only): %s\n",
+                formatted_with_placeholders.c_str());
+        SLT_DBG(slot, "Full prompt with placeholders: %s\n", chat_params_both.prompt.c_str());
+        SLT_DBG(slot, "User-only prompt: %s\n", chat_params_user.prompt.c_str());
+
+        // Tokenize and find placeholder positions
+        llama_tokens placeholder_tokens = common_tokenize(vocab, formatted_with_placeholders, false, true);
+        llama_tokens content_placeholder_tokens = common_tokenize(vocab, content_placeholder, false, true);
+        llama_tokens reasoning_placeholder_tokens = common_tokenize(vocab, reasoning_placeholder, false, true);
+
+        SLT_DBG(slot, "Token counts: placeholder_tokens=%zu, reasoning_placeholder_tokens=%zu, content_placeholder_tokens=%zu\n",
+                placeholder_tokens.size(), reasoning_placeholder_tokens.size(), content_placeholder_tokens.size());
+
+        size_t reasoning_start = std::string::npos;
+        size_t content_start = std::string::npos;
+
+        // Find reasoning placeholder position (for reasoning cases 1, 2, 4)
+        if (prefill_with_reasoning) {
+            reasoning_start = find_token_sequence(placeholder_tokens, reasoning_placeholder_tokens);
+            SLT_DBG(slot, "Looking for reasoning placeholder, found at=%zu, size=%zu, expected='%s'\n",
+                    reasoning_start, reasoning_placeholder_tokens.size(), reasoning_placeholder.c_str());
+            if (reasoning_start == std::string::npos) {
+                LOG_ERR("Failed to find REASONING_PLACEHOLDER in template for reasoning prefill case %d.\n"
+                       "Template output: '%s'\n"
+                       "This template does not preserve reasoning_content as a literal placeholder.\n",
+                       prefill_case, formatted_with_placeholders.c_str());
+                return false;
+            }
+        }
+
+        // Find content placeholder position
+        // For case 1, we also need to find it to extract the closing sequence
+        content_start = find_token_sequence(placeholder_tokens, content_placeholder_tokens);
+        SLT_DBG(slot, "Looking for content placeholder, found at=%zu, size=%zu, expected='%s'\n",
+                content_start, content_placeholder_tokens.size(), content_placeholder.c_str());
+        
+        // For cases 2, 3, 4, content placeholder is required
+        // For case 1, it's optional (used to extract closing sequence if found)
+        if (prefill_case != 1 && content_start == std::string::npos) {
+            LOG_ERR("Failed to find CONTENT_PLACEHOLDER in template for prefill case %d. "
+                   "Template output: '%s'",
+                   prefill_case, formatted_with_placeholders.c_str());
+            return false;
+        }
+
+        // Note: Case 1 now intentionally has CONTENT_PLACEHOLDER to extract closing sequence
+        // The closing sequence is the tokens between REASONING_CONTENT and CONTENT placeholders
+
+        SLT_DBG(slot, "Placeholder positions: reasoning_start=%zu, content_start=%zu, prefill_case=%d, prefill_with_reasoning=%d\n",
+                reasoning_start, content_start, prefill_case, (int)prefill_with_reasoning);
+        
+
+        // Extract token sequences for different template parts
+        llama_tokens opening_tokens;          // Before first placeholder
+        llama_tokens between_tokens;          // Between reasoning and content placeholders
+        llama_tokens content_opening_tokens;  // After content placeholder
+
+        if (prefill_with_reasoning && reasoning_start != std::string::npos) {
+            // Cases 1, 2, 4: opening tokens precede reasoning placeholder
+            opening_tokens.assign(placeholder_tokens.begin(), placeholder_tokens.begin() + reasoning_start);
+
+            if (prefill_case != 1 && content_start != std::string::npos) {
+                // Cases 2, 4: extract tokens between reasoning and content placeholders
+                size_t reasoning_end = reasoning_start + reasoning_placeholder_tokens.size();
+                SLT_DBG(slot, "Case 2/4: reasoning_start=%zu, reasoning_end=%zu, content_start=%zu\n",
+                        reasoning_start, reasoning_end, content_start);
+                // Safety check: if reasoning_end exceeds content_start, something went wrong
+                if (reasoning_end > content_start) {
+                    SLT_ERR(slot, "Invalid token positions: reasoning_end (%zu) > content_start (%zu), adjusting\n",
+                            reasoning_end, content_start);
+                    reasoning_end = content_start;
+                }
+                between_tokens.assign(placeholder_tokens.begin() + reasoning_end,
+                                      placeholder_tokens.begin() + content_start);
+
+                size_t content_end = content_start + content_placeholder_tokens.size();
+                if (content_end < placeholder_tokens.size()) {
+                    content_opening_tokens.assign(placeholder_tokens.begin() + content_end,
+                                                  placeholder_tokens.end());
+                }
+            }
+        } else if (prefill_case == 3 && content_start != std::string::npos) {
+            // Case 3: opening tokens precede content placeholder
+            opening_tokens.assign(placeholder_tokens.begin(), placeholder_tokens.begin() + content_start);
+
+            size_t content_end = content_start + content_placeholder_tokens.size();
+            if (content_end < placeholder_tokens.size()) {
+                content_opening_tokens.assign(placeholder_tokens.begin() + content_end,
+                                              placeholder_tokens.end());
+            }
+        }
+
+        // Store opening sequence for Case 1 parsing (needed for reasoning/content separation)
+        if (prefill_case == 1 && !opening_tokens.empty()) {
+            slot.prefill_opening_sequence.clear();
+            for (auto tok : opening_tokens) {
+                slot.prefill_opening_sequence += common_token_to_piece(vocab, tok, true);
+            }
+            SLT_DBG(slot, "Stored opening sequence for Case 1 parsing: %s\n",
+                    slot.prefill_opening_sequence.c_str());
+            
+            // For Case 1, extract the closing sequence (tokens between reasoning and content placeholders)
+            // This identifies where reasoning ends and content begins
+            if (reasoning_start != std::string::npos && content_start != std::string::npos &&
+                content_start > reasoning_start) {
+                size_t reasoning_end = reasoning_start + reasoning_placeholder_tokens.size();
+                if (reasoning_end < content_start) {
+                    slot.prefill_closing_sequence.clear();
+                    for (size_t i = reasoning_end; i < content_start; i++) {
+                        slot.prefill_closing_sequence += common_token_to_piece(vocab, placeholder_tokens[i], true);
+                    }
+                    SLT_DBG(slot, "Stored closing sequence for Case 1 parsing: %s\n",
+                            slot.prefill_closing_sequence.c_str());
+                }
+            }
+        }
+
+        // Tokenize the actual prefill content
+        llama_tokens actual_reasoning_tokens = common_tokenize(vocab, prefill_reasoning_content, false, true);
+        llama_tokens actual_content_tokens = common_tokenize(vocab, prefill_content, false, true);
+
+        // Construct the final prefill token sequence based on case
+        slot.prefill_tokens.clear();
+
+        // Add opening tokens (reasoning block start or content start)
+        slot.prefill_tokens.insert(slot.prefill_tokens.end(), opening_tokens.begin(), opening_tokens.end());
+
+        if (prefill_case != 3) {
+            // Cases 1, 2, 4: Add reasoning content tokens
+            slot.prefill_tokens.insert(slot.prefill_tokens.end(),
+                                       actual_reasoning_tokens.begin(), actual_reasoning_tokens.end());
+
+            // Case 1: no closing tokens (model continues reasoning)
+            // Cases 2, 4: add closing tokens and optionally content
+            if (prefill_case == 2 || prefill_case == 4) {
+                // Add tokens between reasoning and content (closes reasoning, opens message)
+                slot.prefill_tokens.insert(slot.prefill_tokens.end(), between_tokens.begin(), between_tokens.end());
+
+                // Case 2: add content prefill tokens
+                if (prefill_case == 2) {
+                    slot.prefill_tokens.insert(slot.prefill_tokens.end(),
+                                               actual_content_tokens.begin(), actual_content_tokens.end());
+                }
+                // Case 4: no content prefill (model generates from scratch)
+            }
+        } else {
+            // Case 3: content-only prefill
+            slot.prefill_tokens.insert(slot.prefill_tokens.end(),
+                                       actual_content_tokens.begin(), actual_content_tokens.end());
+        }
+
+        slot.has_prefill = !slot.prefill_tokens.empty();
+        slot.prefill_idx = 0;
+
+        SLT_INF(slot, "Prefill tokens constructed: %zu tokens\n", slot.prefill_tokens.size());
+        
+        return true;  // Success
+    }
+
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
         // A new task is being assigned to this slot: its prompt may differ from whatever produced
         // the slot's current `logits_last` (even at the same token count). Invalidate the capture so
@@ -4242,6 +4559,9 @@ private:
         // The stamp is re-established only by a real decode of the new prompt (the capture point).
         slot.logits_last.clear();
         slot.logits_last_n_tokens = -1;
+
+        // Parse return_prefill option
+        slot.return_prefill = json_value(task.data, "__return_prefill", false);
 
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
@@ -4258,6 +4578,29 @@ private:
             }
         } else {
             slot.lora = params_base.lora_adapters;
+        }
+
+        // Handle prefill if present (cases 1-4)
+        if (task.data.contains("__prefill_case") && task.data["__prefill_case"].get<int>() != 0) {
+            slot.prefill_case = json_value(task.data, "__prefill_case", 0);
+            bool prefill_with_reasoning = json_value(task.data, "__prefill_has_reasoning", false);
+            slot.prefill_reasoning_content = json_value(task.data, "__prefill_reasoning", std::string());
+            slot.prefill_content = json_value(task.data, "__prefill_content", std::string());
+
+            SLT_INF(slot, "Setting up prefill, case=%d, prefill_with_reasoning=%d\n",
+                    slot.prefill_case, (int)prefill_with_reasoning);
+
+            if (chat_params.tmpls) {
+                bool success = build_prefill_tokens(slot, slot.prefill_case, prefill_with_reasoning,
+                                    slot.prefill_reasoning_content, slot.prefill_content);
+                if (!success) {
+                    SRV_ERR("Failed to build prefill tokens, case=%d\n", slot.prefill_case);
+                    slot.has_prefill = false;
+                    slot.prefill_case = 0;
+                }
+            } else {
+                SRV_WRN("Chat templates not available for reasoning prefill, case=%d\n", slot.prefill_case);
+            }
         }
 
         // if using alora, make sure it's only a single one requested and active
@@ -4355,6 +4698,15 @@ private:
         // and shutdown, when the transient task may be gone, so it must never read the task for this —
         // it reads slot.prompt.ctx_boundary instead. -1 (no user span) makes the checkpoint no-op.
         slot.prompt.ctx_boundary = task.params.message_spans.first_user_message_pos();
+
+        // Append prefill tokens to the task tokens BEFORE creating the task
+        // This ensures slot.prompt.n_tokens() and task.n_tokens() match
+        if (slot.has_prefill && !slot.prefill_tokens.empty()) {
+            for (auto& tok : slot.prefill_tokens) {
+                task.tokens.push_back(tok);
+            }
+            SLT_INF(slot, "Appended %zu prefill tokens to task, total task tokens: %zu\n", slot.prefill_tokens.size(), task.tokens.size());
+        }
 
         slot.task = std::make_unique<const server_task>(std::move(task));
 
@@ -4619,6 +4971,14 @@ private:
         res->n_prompt_tokens_cache = slot.n_prompt_tokens_cache;
         res->post_sampling_probs   = slot.task->params.post_sampling_probs;
 
+        // Pass prefill state for reasoning content handling
+        res->prefill_case = slot.prefill_case;
+        res->prefill_opening_sequence = slot.prefill_opening_sequence;
+        res->prefill_closing_sequence = slot.prefill_closing_sequence;
+        res->prefill_reasoning_content = slot.prefill_reasoning_content;
+        res->prefill_content = slot.prefill_content;
+        res->return_prefill = slot.return_prefill;
+
         res->verbose           = slot.task->params.verbose;
         res->res_type          = slot.task->params.res_type;
         res->oaicompat_model   = slot.task->params.oaicompat_model;
@@ -4650,14 +5010,20 @@ private:
             slot.debug_generated_text = slot.generated_text;
         }
 
+        // Response content is just the generated text
+        // If return_prefill is true, the prefill content will be prepended in update()
+        // when building the OAI compatible response
+        std::string response_content = slot.generated_text;
+
         // in stream mode, content and tokens are already in last partial chunk
         if (slot.task->params.stream) {
             res->content     = "";
             res->tokens      = llama_tokens{};
         } else {
-            res->content     = std::move(slot.generated_text);
+            res->content     = std::move(response_content);
             res->tokens      = std::move(slot.generated_tokens);
         }
+
         res->timings         = slot.get_timings();
         res->prompt          = slot.task->tokens.detokenize(ctx_tgt, true);
         res->response_fields = std::move(slot.task->params.response_fields);
@@ -4696,6 +5062,14 @@ private:
         }
 
         res->generation_params = slot.task->params; // copy the parameters
+
+        // Pass prefill state for reasoning content handling
+        res->prefill_case = slot.prefill_case;
+        res->prefill_opening_sequence = slot.prefill_opening_sequence;
+        res->prefill_closing_sequence = slot.prefill_closing_sequence;
+        res->prefill_reasoning_content = slot.prefill_reasoning_content;
+        res->prefill_content = slot.prefill_content;
+        res->return_prefill = slot.return_prefill;
 
         queue_results.send(std::move(res));
     }
@@ -7132,6 +7506,9 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
             task.id_slot = json_value(data, "id_slot", -1);
             sse_ping_interval = task.params.sse_ping_interval;
+
+            // Copy prefill data from the JSON request to task.data
+            task.data = data;
 
             // OAI-compat
             task.params.res_type          = res_type;

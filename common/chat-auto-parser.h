@@ -71,10 +71,12 @@ struct generation_params {
     bool                                  is_inference  = true;
     bool                                  add_inference = false;
     bool                                  mark_input    = true;  // whether to mark input strings in the jinja context
-
     bool has_continuation() const {
         return continue_final_message != COMMON_CHAT_CONTINUATION_NONE && !continue_msg.empty();
     }
+
+    // Force thinking_forced_open to true (used for prefill case 1 with reasoning)
+    bool                                  force_thinking_open = false;
 };
 
 // ============================================================================

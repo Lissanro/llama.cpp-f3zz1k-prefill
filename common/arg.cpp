@@ -3778,6 +3778,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PREFILL_ASSISTANT"));
     add_opt(common_arg(
+        {"--return-prefill"},
+        {"--no-return-prefill"},
+        string_format(
+            "whether to return full assistant message including prefilled content (default: %s)\n"
+            "when enabled, the response will include both prefilled and newly generated content",
+            params.return_prefill ? "enabled" : "disabled"
+        ),
+        [](common_params & params, bool value) {
+            params.return_prefill = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_RETURN_PREFILL"));
+    add_opt(common_arg(
         {"-sps", "--slot-prompt-similarity"}, "SIMILARITY",
         string_format("how much the prompt of a request must match the prompt of a slot in order to use that slot (default: %.2f, 0.0 = disabled)\n", params.slot_prompt_similarity),
         [](common_params & params, const std::string & value) {

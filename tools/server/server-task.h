@@ -123,6 +123,14 @@ struct task_result_state {
     const std::string oai_resp_message_id;
     std::string oai_resp_fc_id; // function call ID for current args delta
 
+    // Prefill state for reasoning content handling
+    int32_t prefill_case = 0;  // 0 = no prefill, 1-4 = prefill cases
+    std::string prefill_opening_sequence;
+    std::string prefill_closing_sequence;  // Closing tag for reasoning block (case 1)
+    std::string prefill_reasoning_content;
+    std::string prefill_content;
+    bool return_prefill = false;
+
     task_result_state(const common_chat_parser_params & chat_parser_params);
 
     // parse partial tool calls and update the internal state
@@ -132,6 +140,24 @@ struct task_result_state {
         std::vector<common_chat_msg_diff> & diffs,
         bool filter_tool_calls = false);
 };
+
+// Helper to copy prefill state from result to state
+// Used by both final and partial result update() methods
+inline void copy_prefill_state_to_result(
+        task_result_state & state,
+        int32_t prefill_case,
+        const std::string & prefill_opening_sequence,
+        const std::string & prefill_closing_sequence,
+        const std::string & prefill_reasoning_content,
+        const std::string & prefill_content,
+        bool return_prefill) {
+    state.prefill_case = prefill_case;
+    state.prefill_opening_sequence = prefill_opening_sequence;
+    state.prefill_closing_sequence = prefill_closing_sequence;
+    state.prefill_reasoning_content = prefill_reasoning_content;
+    state.prefill_content = prefill_content;
+    state.return_prefill = return_prefill;
+}
 
 struct server_task {
     int id = -1; // to be filled by server_queue
@@ -152,6 +178,9 @@ struct server_task {
     // used by SERVER_TASK_TYPE_INFERENCE
     task_params   params;
     server_tokens tokens;
+
+    // additional data for prefill and other features
+    json data;
 
     // only used by CLI, this allow tokenizing CLI inputs on server side
     // we need this because mtmd_context and vocab are not accessible outside of server_context
@@ -233,6 +262,7 @@ struct server_task {
         copy.params    = params;
         copy.type      = type;
         copy.tokens    = tokens.clone();
+        copy.data      = data;
         copy.id_slot   = -1; // child tasks cannot specify slot
 
         // use different sampling seed for each child
@@ -376,6 +406,14 @@ struct server_task_result_cmpl_final : server_task_result {
     std::string oai_resp_reasoning_id;
     std::string oai_resp_message_id;
 
+    // Prefill state for reasoning content handling (passed from slot)
+    int prefill_case = 0;
+    std::string prefill_opening_sequence;
+    std::string prefill_closing_sequence;
+    std::string prefill_reasoning_content;
+    std::string prefill_content;
+    bool return_prefill = false;
+
     virtual bool is_stop() override {
         return true; // in stream mode, final responses are considered stop
     }
@@ -384,7 +422,23 @@ struct server_task_result_cmpl_final : server_task_result {
 
     virtual void update(task_result_state & state) override {
         is_updated = true;
+        // Pass prefill state to the state object before parsing
+        copy_prefill_state_to_result(state, prefill_case, prefill_opening_sequence, prefill_closing_sequence,
+                                     prefill_reasoning_content, prefill_content, return_prefill);
         oaicompat_msg = state.update_chat_msg(content, false, oaicompat_msg_diffs);
+
+        // If return_prefill is true, prepend the prefilled content to the message
+        // This is done AFTER parsing so the parser only works with newly generated content
+        if (return_prefill && prefill_case > 0) {
+            // For reasoning cases (1, 2, 4), prepend prefilled reasoning
+            if (!prefill_reasoning_content.empty()) {
+                oaicompat_msg.reasoning_content = prefill_reasoning_content + oaicompat_msg.reasoning_content;
+            }
+            // For content cases (2, 3), prepend prefilled content
+            if (!prefill_content.empty()) {
+                oaicompat_msg.content = prefill_content + oaicompat_msg.content;
+            }
+        }
 
         oai_resp_id = state.oai_resp_id;
         oai_resp_reasoning_id = state.oai_resp_reasoning_id;
@@ -449,6 +503,14 @@ struct server_task_result_cmpl_partial : server_task_result {
 
     // for Anthropic API: track if any reasoning content has been generated
     bool anthropic_has_reasoning = false;
+
+    // Prefill state for reasoning content handling (passed from slot)
+    int prefill_case = 0;
+    std::string prefill_opening_sequence;
+    std::string prefill_closing_sequence;
+    std::string prefill_reasoning_content;
+    std::string prefill_content;
+    bool return_prefill = false;
 
     virtual bool is_stop() override {
         return false; // in stream mode, partial responses are not considered stop

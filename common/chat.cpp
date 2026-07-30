@@ -444,9 +444,10 @@ std::vector<common_chat_msg> common_chat_msgs_parse_oaicompat(const json & messa
                     msg.tool_calls.push_back(tc);
                 }
             }
-            if (!has_content && !has_tool_calls) {
+            auto has_reasoning_content = message.contains("reasoning_content") && !message.at("reasoning_content").is_null();
+            if (!has_content && !has_tool_calls && !has_reasoning_content) {
                 throw std::invalid_argument(
-                    "Expected 'content' or 'tool_calls' (ref: https://github.com/ggml-org/llama.cpp/issues/8367 & "
+                    "Expected 'content', 'tool_calls', or 'reasoning_content' (ref: https://github.com/ggml-org/llama.cpp/issues/8367 & "
                     "https://github.com/ggml-org/llama.cpp/issues/12279)");
             }
             if (message.contains("reasoning_content")) {
@@ -892,8 +893,10 @@ static std::string common_chat_template_direct_apply_impl(
     const std::optional<json> & additional_context = std::nullopt) {
     jinja::context ctx(tmpl.source());
 
+    auto msgs_for_template = messages_override.has_value() ? *messages_override : inputs.messages;
+
     nlohmann::ordered_json inp = nlohmann::ordered_json{
-        {"messages", messages_override.has_value() ? *messages_override : inputs.messages},
+        {"messages", msgs_for_template},
         {"bos_token", tmpl.bos_token()},
         {"eos_token", tmpl.eos_token()},
         {"enable_thinking", inputs.enable_thinking},
@@ -1282,14 +1285,22 @@ static common_chat_params common_chat_params_init_gpt_oss(const common_chat_temp
 
     // Copy reasoning to the "thinking" field as expected by the gpt-oss template
     auto adjusted_messages = json::array();
-    for (auto msg : inputs.messages) {
-        if (msg.contains("reasoning_content") && msg.at("reasoning_content").is_string()) {
-            msg["thinking"] = msg.at("reasoning_content");
-            if (msg.contains("tool_calls") && msg.at("tool_calls").is_array() && !msg.at("tool_calls").empty()) {
-                msg.erase("content");
+    for (const auto & msg : inputs.messages) {
+        auto has_reasoning_content = msg.contains("reasoning_content") && msg.at("reasoning_content").is_string();
+        auto has_tool_calls        = msg.contains("tool_calls") && msg.at("tool_calls").is_array();
+
+        if (has_reasoning_content) {
+            auto adjusted_message = msg;
+            adjusted_message["thinking"] = msg.at("reasoning_content");
+            // Only erase content if there are non-empty tool_calls (original behavior)
+            // For prefill cases, we need to keep content if present
+            if (has_tool_calls && !adjusted_message.at("tool_calls").empty()) {
+                adjusted_message.erase("content");
             }
+            adjusted_messages.push_back(adjusted_message);
+        } else {
+            adjusted_messages.push_back(msg);
         }
-        adjusted_messages.push_back(msg);
     }
 
     auto prompt = common_chat_template_direct_apply_impl(tmpl, inputs, /* messages_override= */ adjusted_messages);
@@ -3356,6 +3367,7 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
     params.tool_choice           = inputs.tool_choice;
     params.reasoning_format      = inputs.reasoning_format;
     params.enable_thinking       = inputs.enable_thinking;
+    params.force_thinking_open   = inputs.force_thinking_open;
     params.grammar               = inputs.grammar;
     params.now                   = inputs.now;
     params.add_generation_prompt = inputs.add_generation_prompt;

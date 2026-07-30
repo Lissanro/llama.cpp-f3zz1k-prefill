@@ -1395,6 +1395,8 @@ json oaicompat_chat_params_parse(
     auto has_tools = tools.is_array() && !tools.empty();
     auto stream = json_value(body, "stream", false);
     auto tool_choice = json_value(body, "tool_choice", std::string("auto"));
+    bool return_prefill = json_value(body, "return_prefill", opt.return_prefill);
+    llama_params["__return_prefill"] = return_prefill;
 
     if (!opt.use_jinja) {
         if (has_tools) {
@@ -1448,8 +1450,8 @@ json oaicompat_chat_params_parse(
             throw std::invalid_argument("All non-assistant messages must contain 'content'");
         }
         if (role == "assistant") {
-            if (!msg.contains("content") && !msg.contains("tool_calls")) {
-                throw std::invalid_argument("Assistant message must contain either 'content' or 'tool_calls'!");
+            if (!msg.contains("content") && !msg.contains("tool_calls") && !msg.contains("reasoning_content")) {
+                throw std::invalid_argument("Assistant message must contain either 'content', 'tool_calls', or 'reasoning_content'!");
             }
             if (!msg.contains("content")) {
                 continue; // avoid errors with no content
@@ -1576,10 +1578,124 @@ json oaicompat_chat_params_parse(
         } // other reasoning_effort values are model-specific and not yet handled
     }
 
+
+    // if the assistant message appears at the end of list, we do not add end-of-turn token
+    // for ex. this can be useful to modify the reasoning process in reasoning models
+    
+    // Detect prefill case
+    bool has_assistant_message_at_end = !inputs.messages.empty() && inputs.messages.back().role == "assistant";
+    bool prefill_with_reasoning = false;
+    int prefill_case = 0;  // 0 = no prefill, 1-4 = cases
+    std::string prefill_reasoning_text;
+    std::string prefill_content_text;
+    
+    // Check if prefill is actually requested before detecting prefill cases
+    bool prefill_assistant_message = has_assistant_message_at_end && opt.prefill_assistant;
+    
+    if (prefill_assistant_message) {
+        const auto& last_msg = inputs.messages.back();
+        
+        // Check if this is a reasoning prefill case
+        // Reasoning prefill is detected when reasoning_content is present
+        if (!last_msg.reasoning_content.empty()) {
+            prefill_with_reasoning = true;
+            prefill_reasoning_text = last_msg.reasoning_content;
+            
+            // Find the original message in the messages array to check content field presence
+            const auto& last_json_msg = messages.back();
+            bool has_content_field = last_json_msg.contains("content");
+            bool content_is_null = has_content_field && last_json_msg.at("content").is_null();
+            std::string content_value = has_content_field && last_json_msg.at("content").is_string()
+                ? last_json_msg.at("content").get<std::string>()
+                : "";
+            
+            // Determine prefill case type based on content field
+            // Prefill case 1: content is null/missing -> continue reasoning
+            // Prefill case 2: content is non-empty -> complete reasoning + continue message
+            // Prefill case 4: content is empty string "" -> complete reasoning + generate message from scratch
+            if (!has_content_field || content_is_null) {
+                // Prefill case 1: No content field or content is null - open reasoning block
+                prefill_case = 1;
+                prefill_content_text = "";
+            } else if (content_value.empty()) {
+                // Prefill case 4: Content field is empty string - closed reasoning, generate message
+                prefill_case = 4;
+                prefill_content_text = "";
+            } else {
+                // Prefill case 2: Content field has non-empty value - closed reasoning, continue message
+                prefill_case = 2;
+                prefill_content_text = content_value;
+            }
+            
+            SRV_INF("Detected reasoning prefill case %d\n", prefill_case);
+            
+            // Note: We do NOT set enable_thinking=false here.
+            // The template will be applied normally (with enable_thinking=true if supported)
+            // and the token extraction happens separately in build_prefill_tokens()
+            // using placeholder-based template subtraction.
+            
+            // For reasoning prefill cases, ensure reasoning_format is not NONE
+            // so that reasoning content gets properly parsed from generated text
+            if (inputs.reasoning_format == COMMON_REASONING_FORMAT_NONE) {
+                inputs.reasoning_format = COMMON_REASONING_FORMAT_AUTO;
+            }
+        }
+    }
+    
+    common_chat_msg last_message;
+    
+    if (prefill_assistant_message) {
+        last_message = inputs.messages.back();
+        
+        // For reasoning prefill cases, we already detected and set up the state above
+        // For content-only prefill (Case 3), detect it here
+        if (!prefill_with_reasoning && !last_message.content.empty()) {
+            // Case 3: Regular assistant content prefill (no reasoning)
+            prefill_case = 3;
+            prefill_content_text = last_message.content;
+            SRV_INF("Detected content-only prefill case %d: %s\n", prefill_case, prefill_content_text.c_str());
+        }
+        
+        // For ALL prefill cases, disable generation prompt since we're continuing an incomplete message
+        if (prefill_case != 0) {
+            inputs.add_generation_prompt = false;
+            // Reset continue_final_message to prevent upstream mechanism from interfering
+            // The prefill patch handles assistant message continuation via build_prefill_tokens()
+            inputs.continue_final_message = COMMON_CHAT_CONTINUATION_NONE;
+        }
+        
+        inputs.messages.pop_back();
+
+        /* sanity check, max one assistant message at the end of the list */
+        if (!inputs.messages.empty() && inputs.messages.back().role == "assistant"){
+            throw std::invalid_argument("Cannot have 2 or more assistant messages at the end of the list.");
+        }
+
+        // For reasoning prefill cases, ensure reasoning_format is not NONE
+        // so that reasoning content gets properly parsed from generated text
+        // (This is now handled above in lines 1100-1104, so no duplicate needed here)
+        // For content-only prefill (case 3), do NOT override reasoning_format
+        // Let it use the model's default behavior - forcing it to NONE breaks reasoning
+    }
+
+    // For prefill case 1 (reasoning_content only), force thinking_forced_open
+    // This handles templates like Kimi K2.5 that don't properly detect open reasoning blocks
+    if (prefill_case == 1) {
+        inputs.force_thinking_open = true;
+    }
     inputs.force_pure_content = opt.force_pure_content;
 
     // Apply chat template to the list of messages
     auto chat_params = common_chat_templates_apply(opt.tmpls.get(), inputs);
+
+
+    // Pass prefill data to slot for ALL prefill cases (cases 1-4)
+    if (prefill_case != 0) {
+        llama_params["__prefill_has_reasoning"] = prefill_with_reasoning;
+        llama_params["__prefill_reasoning"] = prefill_reasoning_text;
+        llama_params["__prefill_content"] = prefill_content_text;
+        llama_params["__prefill_case"] = prefill_case;
+    }
 
     llama_params["chat_format"] = static_cast<int>(chat_params.format);
     llama_params["prompt"]      = chat_params.prompt;

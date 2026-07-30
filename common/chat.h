@@ -277,6 +277,8 @@ struct common_chat_templates_inputs {
     bool                                  add_bos = false;
     bool                                  add_eos = false;
     bool                                  force_pure_content = false;
+    // Force thinking_forced_open to true (used for prefill case 1 with reasoning)
+    bool                                  force_thinking_open = false;
 };
 
 struct common_chat_params {

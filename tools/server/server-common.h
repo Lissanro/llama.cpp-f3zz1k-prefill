@@ -581,6 +581,7 @@ std::vector<server_tokens> tokenize_input_prompts(
 struct server_chat_params {
     bool use_jinja;
     bool prefill_assistant;
+    bool return_prefill;
     common_reasoning_format reasoning_format;
     std::map<std::string, std::string> chat_template_kwargs; // mapping key --> json value
     common_chat_templates_ptr tmpls;
