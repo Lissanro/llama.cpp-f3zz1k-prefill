@@ -95,7 +95,8 @@ upstream.
 
 > **Eviction is opt-in.** Plain `--slot-save-path` (manual `/slots` save, upstream behaviour)
 > never deletes anything. The bounded LRU store only runs when `--slot-save-auto` owns the
-> directory as its cache.
+> directory as its cache, and it only ever evicts `auto-*` files — a manually saved snapshot
+> (any other filename) is permanent: never counted against the caps and never evicted.
 >
 > **Disk note:** one deep snapshot can be several GB (a 158k-token snapshot ≈ 8 GB). Point
 > `--slot-save-path` at a **dedicated directory on a roomy disk**, and size
@@ -168,6 +169,13 @@ On an `--mmproj` server these endpoints used to return 501 across the board; the
 contains media writes an extra `.meta` identity sidecar next to the state file, and a
 restore rebuilds the prompt's media chunks from it — see
 `docs/kv-cache/03-multimodal-cache.md` for the details and limits.
+
+A manual save now writes a `.meta` sidecar for **every** snapshot (text and media), so a
+manually saved cache is also discovered and longest-prefix-restored by the automatic cache
+(the scan indexes any `.bin` with a `.meta`, not just `auto-*` files). Manual saves are
+**never evicted** and **never counted** against `--slot-save-max-count` / `--slot-save-max-mb`:
+the LRU and caps apply only to `auto-*` files. This makes a manually saved workflow a
+permanent, reusable base that the auto cache builds on top of.
 
 ### Pinning a snapshot (permanent, never-evicted cache)
 

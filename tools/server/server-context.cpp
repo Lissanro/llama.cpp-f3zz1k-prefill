@@ -524,6 +524,17 @@ static void slot_save_enforce_limits(const std::string & dir,
                 continue;
             }
 
+            // manual /slots saves (non-"auto-" filenames) are user-owned persistent snapshots,
+            // not part of the auto cache's LRU pool: never counted toward the caps and never evicted.
+            // Their orphaned sidecars (.logits/.meta/.pin) are reaped above; the .bin itself is left
+            // alone so a manually saved cache is never wiped by the auto cache's cleanup.
+            if (p.size() >= 4 && p.compare(p.size() - 4, 4, ".bin") == 0) {
+                const std::string fname = std::filesystem::path(p).filename().string();
+                if (fname.rfind("auto-", 0) != 0) {
+                    continue;
+                }
+            }
+
             slot_save_unit u;
             u.state_path = p;
             // PINNED snapshots (a sibling "<state>.pin" marker) are never evicted and are excluded
@@ -2082,12 +2093,16 @@ private:
     // call repeatedly for the cross-process refresh. Records the dir mtime so a refresh can cheaply
     // tell whether anything changed. CALLER MUST HOLD auto_idx.mtx.
     void auto_index_scan_locked() {
+        SRV_INF("auto cache: scanning directory %s\n", params_base.slot_save_path.c_str());
         std::error_code mec;
         const auto dmt = std::filesystem::last_write_time(params_base.slot_save_path, mec);
         if (!mec) {
             auto_idx.dir_mtime = dmt; // snapshot the dir mtime we are scanning at
         }
         std::error_code ec;
+        // collect .bin and .bin.meta basenames for orphan detection (a .bin without a .meta is an
+        // incomplete/torn save; a .meta without a .bin is a leftover sidecar).
+        std::unordered_set<std::string> bin_files, meta_files;
         for (std::filesystem::directory_iterator it(params_base.slot_save_path, ec), end;
              !ec && it != end; it.increment(ec)) {
             std::error_code fec;
@@ -2095,16 +2110,19 @@ private:
                 continue;
             }
             const std::string p = it->path().string();
-            // only our own state files: basename "auto-*.bin" (sidecars and temps skipped). Requiring
-            // the "auto-" basename prefix rejects foreign/manual .bin files BY NAME before we open any
-            // sidecar — the stated scan optimization.
             const std::string base = it->path().filename().string();
-            if (base.rfind("auto-", 0) != 0) {
-                continue; // not one of ours
-            }
-            if (p.size() < 4 || p.compare(p.size() - 4, 4, ".bin") != 0) {
+            // skip in-flight temp files (a concurrent save owns them)
+            if (p.size() >= 4 && p.compare(p.size() - 4, 4, ".tmp") == 0) {
                 continue;
             }
+            if (p.size() >= 9 && p.compare(p.size() - 9, 9, ".bin.meta") == 0) {
+                meta_files.insert(base.substr(0, base.size() - 9)); // base without ".bin.meta"
+                continue; // sidecar: indexed via its .bin below
+            }
+            if (p.size() < 4 || p.compare(p.size() - 4, 4, ".bin") != 0) {
+                continue; // not a .bin state file
+            }
+            bin_files.insert(base.substr(0, base.size() - 4)); // base without ".bin" — the stated scan optimization.
             // already indexed — or already parse-rejected — by a prior scan? cheap skip so a
             // refresh only opens NEW files (units are immutable after their atomic rename).
             if (auto_idx.indexed_files.count(p) || auto_idx.rejected_files.count(p)) {
@@ -2133,8 +2151,10 @@ private:
                 continue;
             }
             if (!(fp == cur_fp)) {
+                SRV_INF("auto cache: skipping %s - fingerprint mismatch\n", base.c_str());
                 continue; // foreign model / requant / different ctx geometry (invariant 3)
             }
+            SRV_INF("auto cache: loaded %s (%zu tokens)\n", base.c_str(), toks.size());
             // rehash from the sidecar's cells + media records (media empty on v1 => the
             // text-only chain, bit-identical to what the writer keyed the file with). Only
             // chunk-safe boundaries are emitted — including a media unit's pure-text
@@ -2150,6 +2170,21 @@ private:
                 auto_index_insert_locked(bh, e);
             }
             auto_idx.indexed_files.insert(p);
+        }
+
+        // orphan detection: a .bin without a .meta is an incomplete/torn save (the publish
+        // sequence renames .meta LAST); a .meta without a .bin is a leftover sidecar. Both are
+        // benign transient states during a concurrent publish, but persistent ones signal a crashed
+        // save or a manual file deletion.
+        for (const auto & b : bin_files) {
+            if (meta_files.find(b) == meta_files.end()) {
+                SRV_WRN("auto cache: orphan bin file (no .meta): %s.bin\n", b.c_str());
+            }
+        }
+        for (const auto & m : meta_files) {
+            if (bin_files.find(m) == bin_files.end()) {
+                SRV_WRN("auto cache: orphan meta file (no .bin): %s.bin.meta\n", m.c_str());
+            }
         }
     }
 
@@ -5611,22 +5646,26 @@ private:
                         }
                     }
 
-                    // media snapshots publish their identity sidecar (v2 .meta) next to the state
-                    // file: a manual restore rebuilds the prompt's media chunks from it, since —
-                    // unlike the auto-restore path — there is no request to rebuild from. Text
-                    // snapshots keep the base on-disk shape (state file + optional .logits, no
-                    // .meta). A media state file without its sidecar is unrestorable, so a failed
-                    // sidecar write withdraws the whole unit and errors the save (never publish a
-                    // unit that can only be half-loaded). chain_hash is 0: manual units carry
-                    // user-chosen filenames and are never indexed by the auto cache — restore
-                    // authority is the byte-compared tokens.
-                    if (nwrite > 0 && slot_has_media) {
+                    // Publish a .meta sidecar for EVERY manual save (text and media) so the snapshot
+                    // is auto-restorable: the auto disk cache scan indexes any .bin with a .meta, so a
+                    // manually saved snapshot is discovered and longest-prefix-restored like an auto
+                    // one (restore authority is the byte-compared tokens in the .meta). A media
+                    // snapshot carries its per-chunk identity records (v2 .meta); a text snapshot
+                    // carries an empty media list (v1). chain_hash is 0: manual units carry
+                    // user-chosen filenames and are never delta-parented. A media state file without
+                    // its sidecar is unrestorable, so a failed media .meta write withdraws the whole
+                    // unit and errors the save; a failed text .meta is a warning (the .bin is still
+                    // usable for a manual /slots restore, just not auto-restorable).
+                    if (nwrite > 0) {
                         if (!slot_meta_write(filepath, cur_fp, tokens, 0, media)) {
-                            std::error_code ec;
-                            std::filesystem::remove(filepath, ec);
-                            std::filesystem::remove(slot_logits_sidecar_path(filepath), ec);
-                            send_error(task, "failed to write the .meta sidecar for a media slot snapshot", ERROR_TYPE_SERVER);
-                            break;
+                            if (slot_has_media) {
+                                std::error_code ec;
+                                std::filesystem::remove(filepath, ec);
+                                std::filesystem::remove(slot_logits_sidecar_path(filepath), ec);
+                                send_error(task, "failed to write the .meta sidecar for a media slot snapshot", ERROR_TYPE_SERVER);
+                                break;
+                            }
+                            SLT_WRN(*slot, "%s", "failed to write .meta sidecar for manual save (auto-restore disabled for this snapshot)\n");
                         }
                     }
 
