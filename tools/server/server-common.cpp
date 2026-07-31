@@ -1470,7 +1470,13 @@ json oaicompat_chat_params_parse(
             std::string type = json_value(p, "type", std::string());
             if (type == "image_url") {
                 if (!opt.allow_image) {
-                    throw std::runtime_error("image input is not supported - hint: if this is unexpected, you may need to provide the mmproj");
+                    // text-only model: skip the image gracefully so a chat history containing
+                    // images can still be processed instead of failing the whole request
+                    LOG_WRN("%s: skipping image for text-only model\n", __func__);
+                    p["type"] = "text";
+                    p["text"] = "[image omitted]";
+                    p.erase("image_url");
+                    continue;
                 }
 
                 json image_url = json_value(p, "image_url", json::object());
@@ -1483,7 +1489,12 @@ json oaicompat_chat_params_parse(
 
             } else if (type == "input_audio") {
                 if (!opt.allow_audio) {
-                    throw std::runtime_error("audio input is not supported - hint: if this is unexpected, you may need to provide the mmproj");
+                    // text-only model: skip the audio gracefully (see image_url above)
+                    LOG_WRN("%s: skipping audio for text-only model\n", __func__);
+                    p["type"] = "text";
+                    p["text"] = "[audio omitted]";
+                    p.erase("input_audio");
+                    continue;
                 }
 
                 // note: don't need to validate "format", it's redundant
@@ -1498,7 +1509,12 @@ json oaicompat_chat_params_parse(
 
             } else if (type == "input_video") {
                 if (!opt.allow_video) {
-                    throw std::runtime_error("video input is not supported - hint: if this is unexpected, you may need to provide the mmproj");
+                    // text-only model: skip the video gracefully (see image_url above)
+                    LOG_WRN("%s: skipping video for text-only model\n", __func__);
+                    p["type"] = "text";
+                    p["text"] = "[video omitted]";
+                    p.erase("input_video");
+                    continue;
                 }
 
                 json input_video = json_value(p, "input_video", json::object());
