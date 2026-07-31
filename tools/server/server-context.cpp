@@ -2122,7 +2122,7 @@ private:
             if (p.size() < 4 || p.compare(p.size() - 4, 4, ".bin") != 0) {
                 continue; // not a .bin state file
             }
-            bin_files.insert(base.substr(0, base.size() - 4)); // base without ".bin" — the stated scan optimization.
+            bin_files.insert(base.substr(0, base.size() - 4)); // base without ".bin"
             // already indexed — or already parse-rejected — by a prior scan? cheap skip so a
             // refresh only opens NEW files (units are immutable after their atomic rename).
             if (auto_idx.indexed_files.count(p) || auto_idx.rejected_files.count(p)) {
@@ -2151,7 +2151,21 @@ private:
                 continue;
             }
             if (!(fp == cur_fp)) {
-                SRV_INF("auto cache: skipping %s - fingerprint mismatch\n", base.c_str());
+                SRV_INF("auto cache: skipping %s - fingerprint mismatch"
+                        " (cached: model=%lu n_ctx_train=%u n_embd=%u n_layer=%u rope=%u n_ctx=%u"
+                        " kv_full=%u block=%lu rope_scale=%lu rope_base=%lu yarn=(%u,%u,%u,%u,%u)"
+                        " lora=%lu mmproj=%u/%lu; current: model=%lu n_ctx_train=%u n_embd=%u n_layer=%u"
+                        " rope=%u n_ctx=%u kv_full=%u block=%lu rope_scale=%lu rope_base=%lu"
+                        " yarn=(%u,%u,%u,%u,%u) lora=%lu mmproj=%u/%lu)\n",
+                        base.c_str(),
+                        (unsigned long) fp.fp_model, fp.fp_n_ctx_train, fp.fp_n_embd, fp.fp_n_layer, fp.fp_rope_type, fp.fp_n_ctx,
+                        fp.fp_kv_full, (unsigned long) fp.fp_block, (unsigned long) fp.fp_rope_scale, (unsigned long) fp.fp_rope_base,
+                        fp.fp_yarn_ext, fp.fp_yarn_attn, fp.fp_yarn_beta_fast, fp.fp_yarn_beta_slow, fp.fp_yarn_orig_ctx,
+                        (unsigned long) fp.fp_lora, fp.fp_mmproj_loaded, (unsigned long) fp.fp_mmproj,
+                        (unsigned long) cur_fp.fp_model, cur_fp.fp_n_ctx_train, cur_fp.fp_n_embd, cur_fp.fp_n_layer, cur_fp.fp_rope_type, cur_fp.fp_n_ctx,
+                        cur_fp.fp_kv_full, (unsigned long) cur_fp.fp_block, (unsigned long) cur_fp.fp_rope_scale, (unsigned long) cur_fp.fp_rope_base,
+                        cur_fp.fp_yarn_ext, cur_fp.fp_yarn_attn, cur_fp.fp_yarn_beta_fast, cur_fp.fp_yarn_beta_slow, cur_fp.fp_yarn_orig_ctx,
+                        (unsigned long) cur_fp.fp_lora, cur_fp.fp_mmproj_loaded, (unsigned long) cur_fp.fp_mmproj);
                 continue; // foreign model / requant / different ctx geometry (invariant 3)
             }
             SRV_INF("auto cache: loaded %s (%zu tokens)\n", base.c_str(), toks.size());

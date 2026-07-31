@@ -392,19 +392,25 @@ struct model_fp {
                fp_n_ctx_train == o.fp_n_ctx_train && fp_n_embd == o.fp_n_embd &&
                fp_n_layer == o.fp_n_layer && fp_rope_type == o.fp_rope_type &&
                fp_cache_k == o.fp_cache_k && fp_cache_v == o.fp_cache_v &&
-               fp_n_ctx == o.fp_n_ctx && fp_kv_full == o.fp_kv_full &&
-               fp_block == o.fp_block && fp_rope_scale == o.fp_rope_scale &&
-               fp_rope_base == o.fp_rope_base && fp_yarn_ext == o.fp_yarn_ext &&
-               fp_yarn_attn == o.fp_yarn_attn && fp_yarn_beta_fast == o.fp_yarn_beta_fast &&
-               fp_yarn_beta_slow == o.fp_yarn_beta_slow && fp_yarn_orig_ctx == o.fp_yarn_orig_ctx &&
-               fp_lora == o.fp_lora && fp_mmproj_loaded == o.fp_mmproj_loaded &&
-               fp_mmproj == o.fp_mmproj;
+               fp_kv_full == o.fp_kv_full && fp_block == o.fp_block &&
+               fp_rope_scale == o.fp_rope_scale && fp_rope_base == o.fp_rope_base &&
+               fp_yarn_ext == o.fp_yarn_ext && fp_yarn_attn == o.fp_yarn_attn &&
+               fp_yarn_beta_fast == o.fp_yarn_beta_fast && fp_yarn_beta_slow == o.fp_yarn_beta_slow &&
+               fp_yarn_orig_ctx == o.fp_yarn_orig_ctx && fp_lora == o.fp_lora &&
+               fp_mmproj_loaded == o.fp_mmproj_loaded && fp_mmproj == o.fp_mmproj;
+        // NOTE: fp_n_ctx is intentionally EXCLUDED from the comparison. The effective per-seq
+        // n_ctx can vary across runs due to padding/rounding (e.g. 326400 vs 326656) without
+        // affecting cache validity — the KV state is valid as long as the model architecture,
+        // cache type, rope/YaRN, block size, LoRA, and mmproj match. A restore into a context
+        // whose n_ctx is too small for the saved state fails gracefully (invariant 4: any failure
+        // falls back to a normal prefill). fp_n_ctx is still serialized in the .meta and shown in
+        // the fingerprint-mismatch log for debugging.
     }
 
-    // 64-bit digest of EVERY identity field above — the exact set operator== compares.
-    // Used only to name the auto-snapshot files (auto_state_filename): two peers sharing
-    // one --slot-save-path that agree on fp_model but differ in any geometry field
-    // (cache-type, block, rope/YaRN, n_ctx, LoRA, mmproj, ...) would otherwise mint the
+    // 64-bit digest of EVERY identity field compared by operator== (fp_n_ctx is EXCLUDED —
+    // see the note above). Used only to name the auto-snapshot files (auto_state_filename):
+    // two peers sharing one --slot-save-path that agree on fp_model but differ in any geometry
+    // field (cache-type, block, rope/YaRN, LoRA, mmproj, ...) would otherwise mint the
     // same filename for the same token prefix and atomically rename over each other; a
     // full-identity prefix gives them disjoint names so both coexist. It is NOT the index
     // key or a restore gate — the block-chain hash keeps its fp_model salt (text-only

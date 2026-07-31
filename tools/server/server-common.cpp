@@ -960,7 +960,6 @@ uint64_t model_fp::identity_hash() const {
     h = auto_hash_mix64(h, fp_rope_type);
     h = auto_hash_mix64(h, fp_cache_k);
     h = auto_hash_mix64(h, fp_cache_v);
-    h = auto_hash_mix64(h, fp_n_ctx);
     h = auto_hash_mix64(h, fp_kv_full);
     h = auto_hash_mix64(h, fp_block);
     h = auto_hash_mix64(h, fp_rope_scale);
