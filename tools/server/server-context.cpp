@@ -2892,6 +2892,161 @@ private:
         return n_keep_disk;
     }
 
+    // Compact shorter exact-prefix auto-cache WHOLE-ROOT snapshots after a whole-root save.
+    // Called with auto_idx.mtx held. Only runs when --slot-save-incremental is OFF (whole snapshots
+    // supersede shorter prefixes) and --slot-save-compact is enabled. Only whole-root (full) caches
+    // are ever compacted — delta nodes from a --slot-save-incremental run are never compacted (their
+    // space is reclaimed by the tree-aware LRU). Manual saves are skipped by filename; a whole root
+    // that still has live delta children on disk is protected so compaction never leaves an orphan
+    // delta behind. A candidate is deleted only when its cell tokens (and media records) are an
+    // EXACT prefix of the just-saved snapshot. The new snapshot must already be safely on disk
+    // before this runs to avoid data loss if interrupted during save.
+    void auto_compact_after_save_locked(const std::string & new_path,
+                                        const llama_tokens & new_toks,
+                                        const std::vector<server_media_record> & new_media) {
+        if (params_base.slot_save_incremental || !params_base.slot_save_compact || new_toks.empty()) {
+            return;
+        }
+        // only auto-cache files are candidates; manual filenames are user-owned and never compacted
+        const std::string new_fname = std::filesystem::path(new_path).filename().string();
+        if (new_fname.rfind("auto-", 0) != 0) {
+            return;
+        }
+
+        struct compact_entry {
+            std::string path;
+            llama_tokens toks;
+            std::vector<server_media_record> media;
+            uint64_t parent_id = 0;
+            uint32_t range_lo  = 0;
+            bool     has_children = false;
+        };
+
+        std::error_code ec;
+        std::vector<compact_entry> all;
+        std::map<std::pair<uint64_t, uint32_t>, size_t> node_by_key;
+
+        for (std::filesystem::directory_iterator it(params_base.slot_save_path, ec), end;
+             !ec && it != end; it.increment(ec)) {
+            std::error_code fec;
+            if (!it->is_regular_file(fec) || fec) {
+                continue;
+            }
+            const std::string p = it->path().string();
+            const std::string fname = it->path().filename().string();
+            if (fname.rfind("auto-", 0) != 0) {
+                continue; // manual saves are never auto-compacted
+            }
+            if (p.size() < 4 || p.compare(p.size() - 4, 4, ".bin") != 0) {
+                continue;
+            }
+            if (p == new_path) {
+                continue; // skip the just-written snapshot
+            }
+            model_fp fp;
+            llama_tokens meta_toks;
+            std::vector<server_media_record> meta_media;
+            uint64_t parent_id = 0;
+            uint32_t range_lo = 0, range_hi = 0;
+            if (!slot_meta_read(p, cur_fp.fp_mmproj, fp, meta_toks, meta_media,
+                                &parent_id, &range_lo, &range_hi)) {
+                continue;
+            }
+            if (!(fp == cur_fp)) {
+                continue; // different model/geometry: not a prefix of this prompt
+            }
+            compact_entry e;
+            e.path = p;
+            e.toks = std::move(meta_toks);
+            e.media = std::move(meta_media);
+            e.parent_id = parent_id;
+            e.range_lo  = range_lo;
+            all.push_back(std::move(e));
+        }
+
+        // Build the on-disk node identity map so we can protect parents of live delta chains.
+        for (size_t i = 0; i < all.size(); ++i) {
+            uint64_t node_id = 0;
+            uint32_t n_tokens = 0;
+            if (slot_save_parse_node_id(all[i].path, node_id, n_tokens)) {
+                node_by_key[{node_id, n_tokens}] = i;
+            }
+        }
+        for (size_t i = 0; i < all.size(); ++i) {
+            if (all[i].parent_id != 0) {
+                auto it = node_by_key.find({all[i].parent_id, all[i].range_lo});
+                if (it != node_by_key.end()) {
+                    all[it->second].has_children = true;
+                }
+            }
+        }
+
+        std::unordered_set<std::string> to_delete;
+        for (const auto & e : all) {
+            // only WHOLE-ROOT snapshots are compaction candidates. A delta node (parent_id != 0)
+            // is part of an incremental checkpoint tree and is never compacted here — its space
+            // is reclaimed by the tree-aware LRU, never by prefix compaction. This also keeps a
+            // previous --slot-save-incremental run safe when the server is later restarted without
+            // incremental mode: its delta nodes are left untouched.
+            if (e.parent_id != 0) {
+                continue;
+            }
+            if (e.has_children) {
+                continue; // a live delta still depends on this whole root
+            }
+            // a pinned snapshot is user-reserved and must survive compaction like it survives LRU
+            std::error_code pec;
+            if (std::filesystem::exists(e.path + ".pin", pec) && !pec) {
+                continue;
+            }
+            if (e.toks.size() >= new_toks.size()) {
+                continue; // only shorter prefixes are superseded
+            }
+            // exact cell-token prefix match (media cells are LLAMA_TOKEN_NULL on both sides)
+            if (!std::equal(e.toks.begin(), e.toks.end(), new_toks.begin())) {
+                continue;
+            }
+            // media records inside the shared prefix must also match byte-for-byte
+            bool media_ok = true;
+            for (const auto & rec : e.media) {
+                if ((size_t) rec.start_idx >= e.toks.size()) {
+                    break; // record starts outside the shared prefix
+                }
+                const auto it = std::lower_bound(new_media.begin(), new_media.end(), rec.start_idx,
+                    [](const server_media_record & r, uint32_t s) { return r.start_idx < s; });
+                const bool match = it != new_media.end()             &&
+                                   it->start_idx == rec.start_idx    &&
+                                   it->id        == rec.id           &&
+                                   it->n_tokens  == rec.n_tokens     &&
+                                   it->n_pos     == rec.n_pos        &&
+                                   it->nx        == rec.nx           &&
+                                   it->ny        == rec.ny           &&
+                                   it->is_audio  == rec.is_audio;
+                if (!match) {
+                    media_ok = false;
+                    break;
+                }
+            }
+            if (!media_ok) {
+                continue;
+            }
+            to_delete.insert(e.path);
+        }
+
+        for (const auto & path : to_delete) {
+            SRV_INF("auto cache: compacting %s\n", path.c_str());
+            std::error_code dec;
+            std::filesystem::remove(path, dec);
+            std::filesystem::remove(slot_meta_sidecar_path(path), dec);
+            std::filesystem::remove(slot_logits_sidecar_path(path), dec);
+        }
+        // remove now-stale index entries immediately so a concurrent restore does not try to use a
+        // compacted-away file (it would fail safely anyway, but avoiding the attempt is cleaner).
+        if (!to_delete.empty()) {
+            auto_index_drop_missing_locked();
+        }
+    }
+
     // AUTO-SAVE: persist a slot's KV before it is discarded, keyed by its token-prefix block hash.
     // Text-only prompts publish v1 .meta sidecars byte-identical to the pre-media format; media
     // prompts publish v2 sidecars carrying per-chunk identity records (the KV state file already
@@ -2920,7 +3075,8 @@ private:
                                size_t kb,
                                const model_fp & fp,
                                const std::vector<server_media_record> & media = {},
-                               uint64_t parent_id = 0) {
+                               uint64_t parent_id = 0,
+                               bool allow_compact = true) {
         bool     is_node   = lo > 0;      // lo > 0 <=> a delta parented at parent_hi == lo
         uint32_t parent_hi = (uint32_t) lo; // both cleared below if the U6 delta cell-count check fails
         // the snapshot's own token prefix [0, hi): equals `toks` for a whole/delta save (hi == N),
@@ -3116,9 +3272,14 @@ private:
                     snap_toks.size(), media.size(), fname.c_str());
         }
 
-        // index insert (bhs[0..kb] -> this snapshot), then bounded-LRU + reconcile.
+        // Compact shorter exact-prefix whole snapshots (only when incremental is off). The new
+        // snapshot is safely on disk, so deleting older prefixes cannot lose data. Delta parents
+        // and manual saves are protected. Runs under the same lock as the index insert.
         {
             std::lock_guard<std::mutex> lk(auto_idx.mtx);
+            if (allow_compact && !is_node) {
+                auto_compact_after_save_locked(fname, snap_toks, media);
+            }
             auto_cache_entry e{ fname, (uint32_t) snap_toks.size(), fp };
             for (size_t i = 0; i <= kb && i < bhs.size(); ++i) {
                 auto_index_insert_locked(bhs[i], e);
@@ -3218,7 +3379,8 @@ private:
         // media empty, parent_id 0). Same capacity pre-flight, pid+nonce temp, three-file temp->rename
         // (meta last) publish + per-boundary index insert as every other save.
         auto_publish_snapshot(slot, ctx_tgt, toks, /*lo=*/0, /*hi=*/B_ctx,
-                              ckpt_hash, bhs, /*kb=*/kb, cur_fp);
+                              ckpt_hash, bhs, /*kb=*/kb, cur_fp,
+                              /*media=*/{}, /*parent_id=*/0, /*allow_compact=*/false);
     }
 
     void auto_save_slot_if_useful(server_slot & slot) {

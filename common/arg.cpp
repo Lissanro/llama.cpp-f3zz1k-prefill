@@ -3578,6 +3578,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SLOT_SAVE_INCREMENTAL").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--slot-save-compact"},
+        {"--no-slot-save-compact"},
+        "for the auto disk cache in whole-snapshot mode (without --slot-save-incremental), delete "
+        "shorter exact-prefix auto-cache snapshots after a successful save to reclaim disk space. "
+        "Manual saves and snapshots that are still parents of a delta chain are never compacted "
+        "(default: enabled)",
+        [](common_params & params, bool value) {
+            params.slot_save_compact = value;
+        }
+    ).set_env("LLAMA_ARG_SLOT_SAVE_COMPACT").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--slot-save-block"}, "N",
         string_format("token-ID hash block size for the auto disk cache index; reuse granularity "
                       "is one block (default: %d)", params.slot_save_block),

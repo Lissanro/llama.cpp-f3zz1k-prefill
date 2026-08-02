@@ -110,6 +110,9 @@ def _make_server(incremental: bool, fa: str = "off", n_ctx: int = 512, n_slots: 
     s.slot_save_path = CACHE_DIR
     s.slot_save_auto = True
     s.slot_save_incremental = incremental
+    # compaction is orthogonal to incremental; disable it here so these tests observe the
+    # natural save behaviour (a dedicated suite covers compaction on its own).
+    s.slot_save_compact = False
     s.slot_save_block = 16       # small block so short test prompts clear the boundary
     s.slot_save_min_tokens = 0   # keep the floor at the hash block size
     s.slot_save_idle_seconds = IDLE_SECONDS

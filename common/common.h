@@ -683,6 +683,9 @@ struct common_params {
     bool    slot_save_auto  = false;  // master switch; requires slot_save_path to be set
     bool    slot_save_incremental = false; // save only the KV delta since the last checkpoint instead
                                            // of a complete snapshot each time; requires slot_save_auto
+    bool    slot_save_compact = true; // when not using --slot-save-incremental, delete shorter
+                                      // exact-prefix auto-cache snapshots after a whole save to
+                                      // reclaim disk space; manual saves are never compacted
     int32_t slot_save_block = 256;    // token-ID hash block size (vLLM-APC / SGLang-radix style)
     // minimum snapshot size (in cells/tokens) worth persisting: a trivially small prefix saves
     // little prefill against the state-file write + later restore, so it is skipped. The effective
