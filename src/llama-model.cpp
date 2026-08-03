@@ -318,6 +318,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_step35(params);
         case LLM_ARCH_INKLING:
             return new llama_model_inkling(params);
+        case LLM_ARCH_GIGACHAT35:
+            return new llama_model_gigachat35(params);
         default:
             throw std::runtime_error(std::string("unsupported model architecture: '") + llm_arch_name(arch) + "'");
     }
@@ -519,7 +521,12 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     };
 
     auto get_split_segments = [&](int axis, uint32_t il) -> std::vector<std::pair<int64_t, uint32_t>> {
-        if (ud->model->arch == LLM_ARCH_QWEN3NEXT || ud->model->arch == LLM_ARCH_QWEN35 || ud->model->arch == LLM_ARCH_QWEN35MOE) {
+        const bool is_linear_attn_split =
+            ud->model->arch == LLM_ARCH_QWEN3NEXT ||
+            ud->model->arch == LLM_ARCH_QWEN35 ||
+            ud->model->arch == LLM_ARCH_QWEN35MOE ||
+            (ud->model->arch == LLM_ARCH_GIGACHAT35 && hparams.is_recr(il));
+        if (is_linear_attn_split) {
             const int64_t head_k_dim = hparams.ssm_d_state;
             const int64_t head_v_dim = hparams.ssm_d_state;
             const int64_t n_k_heads  = hparams.ssm_n_group;
@@ -530,7 +537,7 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             // both Qwen 3 Next and Qwen 3.5 support n_v_heads > n_k_heads but the broadcasting pattern is different:
             //   - Qwen 3 Next: [k0_v0, k0_v1, k1_v2, k1_v3] (this is the default split pattern)
             //   - Qwen 3.5:    [k0_v0, k1_v1, k0_v2, k1_v3] (needs segmenting of V on the scale of K to get the correct pattern)
-            if (ud->model->arch == LLM_ARCH_QWEN3NEXT) {
+            if (ud->model->arch == LLM_ARCH_QWEN3NEXT || ud->model->arch == LLM_ARCH_GIGACHAT35) {
                 if (std::regex_match(tensor_name, pattern_qkv_weight) || std::regex_match(tensor_name, pattern_ssm_conv1d)) {
                     GGML_ASSERT(tensor->ne[axis] == 2*key_dim + value_dim);
                     return {{key_dim, 2}, {value_dim, 1}};
@@ -836,6 +843,7 @@ const char * llm_type_name(llm_type type) {
         case LLM_TYPE_310B_A15B:     return "310B.A15B";
         case LLM_TYPE_355B_A32B:     return "355B.A32B";
         case LLM_TYPE_397B_A17B:     return "397B.A17B";
+        case LLM_TYPE_432B_A28B:     return "432B.A28B";
         case LLM_TYPE_685B_A37B:     return "685B.A37B";
         case LLM_TYPE_744B_A40B:     return "744B.A40B";
         case LLM_TYPE_E2B:           return "E2B";
@@ -2226,11 +2234,11 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         // checks
         default:
             {
-                // The MTP head is dense-attention only on hybrid Qwen3-Next/3.5/3.6, so use a plain
+                // The MTP head is dense-attention only on hybrid Qwen3-Next/3.5/3.6 and GigaChat 3.5, so use a plain
                 // attention KV cache for the MTP context instead of the hybrid wrapper.
                 const bool mtp_on_hybrid_qwen =
                     params.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
-                    (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE);
+                    (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_GIGACHAT35);
 
                 if (llm_arch_is_recurrent(arch)) {
                     res = new llama_memory_recurrent(
@@ -2258,7 +2266,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                         filter_recr = [&](uint32_t il) {
                             return hparams.is_recr(il) && hparams.n_ff(il) == 0;
                         };
-                    } else if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE) {
+                    } else if (arch == LLM_ARCH_QWEN3NEXT || arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE || arch == LLM_ARCH_GIGACHAT35) {
                         filter_attn = [&](uint32_t il) {
                             return il < hparams.n_layer() && !hparams.is_recr(il);
                         };
@@ -2615,6 +2623,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_LLAMA_EMBED:
         case LLM_ARCH_MAINCODER:
         case LLM_ARCH_GLM_DSA:
+        case LLM_ARCH_GIGACHAT35:
         case LLM_ARCH_NANBEIGE:
         case LLM_ARCH_INSTELLA_MOE:
             return LLAMA_ROPE_TYPE_NORM;
