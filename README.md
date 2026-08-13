@@ -1,10 +1,15 @@
 # llama.cpp
 
-> **🔧 Fork note:** This is a patched fork of upstream llama.cpp. The `main-patched`
-> branch adds **disk KV caching for recurrent/hybrid models** (Qwen3.6, Qwen3-Next, Mamba,
-> Falcon-H, Jamba, …) and **text-turn caching on `--mmproj` servers**, including an opt-in
-> automatic cross-process prompt cache. See **[README-FORK.md](README-FORK.md)** for what
-> it does, the new flags, and how to use/test/update it. Everything below is stock upstream.
+> **🔧 Fork note:** This is a patched fork of upstream llama.cpp based on
+> https://github.com/F3zz1k/llama.cpp/tree/main-patched
+> This prefill branch adds improved prefill support: [docs/prefill-continuation.md](docs/prefill-continuation.md)
+> It also add support for additional models (Kimi K3 including vision support, GigaChat 3.5)
+> Additionally, it adds improved auto disc caching on top of F3zz1k's work (refer to the commit
+> history for details). The original F3zz1k's main-patched branch adds **disk KV caching for
+> recurrent/hybrid models** (Qwen3.6, Qwen3-Next, Mamba, Falcon-H, Jamba, …) and **text-turn
+> caching on `--mmproj` servers**, including an opt-in automatic cross-process prompt cache.
+> See **[README-FORK.md](README-FORK.md)** for what it does, the new flags, and how to
+> use/test/update it. Everything below is stock upstream.
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
