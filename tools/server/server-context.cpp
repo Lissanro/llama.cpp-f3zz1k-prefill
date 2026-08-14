@@ -3094,7 +3094,8 @@ private:
                                const model_fp & fp,
                                const std::vector<server_media_record> & media = {},
                                uint64_t parent_id = 0,
-                               bool allow_compact = true) {
+                               bool allow_compact = true,
+                               const char * why = "unknown") {
         bool     is_node   = lo > 0;      // lo > 0 <=> a delta parented at parent_hi == lo
         uint32_t parent_hi = (uint32_t) lo; // both cleared below if the U6 delta cell-count check fails
         // the snapshot's own token prefix [0, hi): equals `toks` for a whole/delta save (hi == N),
@@ -3284,10 +3285,11 @@ private:
         }
 
         if (media.empty()) {
-            SLT_INF(slot, "auto-save: persisted %zu tokens to %s\n", snap_toks.size(), fname.c_str());
+            SLT_INF(slot, "auto-save: persisted %zu tokens to %s (reason: %s)\n",
+                    snap_toks.size(), fname.c_str(), why);
         } else {
-            SLT_INF(slot, "auto-save: persisted %zu cells incl. %zu media chunks to %s\n",
-                    snap_toks.size(), media.size(), fname.c_str());
+            SLT_INF(slot, "auto-save: persisted %zu cells incl. %zu media chunks to %s (reason: %s)\n",
+                    snap_toks.size(), media.size(), fname.c_str(), why);
         }
 
         // Compact shorter exact-prefix whole snapshots (only when incremental is off). The new
@@ -3398,10 +3400,13 @@ private:
         // (meta last) publish + per-boundary index insert as every other save.
         auto_publish_snapshot(slot, ctx_tgt, toks, /*lo=*/0, /*hi=*/B_ctx,
                               ckpt_hash, bhs, /*kb=*/kb, cur_fp,
-                              /*media=*/{}, /*parent_id=*/0, /*allow_compact=*/false);
+                              /*media=*/{}, /*parent_id=*/0, /*allow_compact=*/false,
+                              /*why=*/ "context-base");
     }
 
-    void auto_save_slot_if_useful(server_slot & slot) {
+    // `why` names the save trigger (idle flush, slot reassign, RAM eviction, shutdown, ...)
+    // so every persisted snapshot is attributable to its cause in the INFO log line.
+    void auto_save_slot_if_useful(server_slot & slot, const char * why) {
         if (!auto_cache_enabled()) {
             return; // off by default
         }
@@ -3613,7 +3618,8 @@ private:
                               /*lo=*/ have_parent ? (int32_t) parent_hi : 0,
                               /*hi=*/ (int32_t) toks.size(),
                               full_hash, bhs, /*kb=*/ bhs.size() - 1, cur_fp,
-                              /*media=*/ media, /*parent_id=*/ have_parent ? parent_id : 0);
+                              /*media=*/ media, /*parent_id=*/ have_parent ? parent_id : 0,
+                              /*allow_compact=*/ true, why);
 
         // stamp the flush timer: the slot's KV is now on disk.
         slot.last_disk_save_time = ggml_time_us();
@@ -3657,7 +3663,7 @@ private:
                         AUTO_SAVE_SHUTDOWN_DEADLINE_MS, slots.size() - i);
                 break;
             }
-            auto_save_slot_if_useful(slots[i]);
+            auto_save_slot_if_useful(slots[i], "shutdown");
         }
     }
 
@@ -3713,7 +3719,7 @@ private:
             if (now_ms - slot.t_last_used / 1000 < idle_ms) {
                 continue; // not idle long enough yet
             }
-            auto_save_slot_if_useful(slot);
+            auto_save_slot_if_useful(slot, "idle-flush");
             slot.auto_idle_flushed = true; // one attempt per idle period; a reclaim/next task re-arms it
             return;                        // at most one flush per wakeup, then back to service tasks
         }
@@ -4117,7 +4123,7 @@ private:
                         const int64_t interval_us =
                             (int64_t) params_base.slot_save_flush_interval_sec * 1000000;
                         if (s->last_disk_save_time < 0 || now - s->last_disk_save_time >= interval_us) {
-                            auto_save_slot_if_useful(*s);
+                            auto_save_slot_if_useful(*s, "periodic-flush");
                         }
                     }
                 }
@@ -4459,7 +4465,7 @@ private:
             // redundant call a cheap no-op. Reads `update_cache` BEFORE the `&& prompt_cache`
             // narrowing so disk save works without --cache-ram.
             if (auto_cache_enabled() && update_cache) {
-                auto_save_slot_if_useful(*ret);
+                auto_save_slot_if_useful(*ret, "slot-reassign");
             }
 
             update_cache = update_cache && prompt_cache;
@@ -4515,7 +4521,7 @@ private:
                 // when a snapshot already covers this prefix (dedup) or the prefix is below the
                 // save floor, so the common case (already persisted) costs only an index check.
                 if (auto_cache_enabled()) {
-                    auto_save_slot_if_useful(slot);
+                    auto_save_slot_if_useful(slot, "kv-pressure-purge");
                 }
 
                 slot.prompt_clear();
@@ -5651,7 +5657,7 @@ private:
                                 // when the feature is OFF; the callee re-checks all correctness guards
                                 // (fingerprint, need_sampling, LoRA, media identity, >=1 block).
                                 if (auto_cache_enabled()) {
-                                    auto_save_slot_if_useful(slot);
+                                    auto_save_slot_if_useful(slot, "idle-slot-ram-evict");
                                 }
                                 SLT_TRC(slot, "%s", "saving idle slot to prompt cache\n");
 
@@ -7007,7 +7013,7 @@ private:
                         // the restored snapshot (n_past == n_tokens) so this is skipped, and the
                         // restore-continue fast path returns above before reaching here.
                         if (auto_cache_enabled() && n_past < (int) slot.prompt.tokens.size()) {
-                            auto_save_slot_if_useful(slot);
+                            auto_save_slot_if_useful(slot, "context-shift");
                         }
 
                         slot.prompt.tokens.keep_first(n_past);
