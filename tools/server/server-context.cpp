@@ -2659,8 +2659,14 @@ private:
     // fingerprint (invariant 3), then restore. Returns the verified prefix length actually
     // restored, or 0 if nothing was restored (caller keeps the in-memory prefill path).
     // `req` is the full request; `n_keep_mem` is the in-memory match to beat.
+    // On a 0 return `rej_reason` (when non-null) holds a short human-readable cause, so the
+    // caller can log a per-request restore summary without --verbose.
     int auto_restore_into_slot(server_slot & slot, const auto_cache_entry & cand,
-                               const server_tokens & req, int n_keep_mem) {
+                               const server_tokens & req, int n_keep_mem,
+                               std::string * rej_reason = nullptr) {
+        if (rej_reason) {
+            rej_reason->clear();
+        }
         // read the small .meta sidecar (tokens + fp + media records) — never opens the multi-GB
         // state file (invariant 5).
         model_fp disk_fp;
@@ -2671,9 +2677,11 @@ private:
         uint32_t disk_range_hi  = 0;
         if (!slot_meta_read(cand.state_path, cur_fp.fp_mmproj, disk_fp, disk_toks, disk_media,
                             &disk_parent_id, &disk_range_lo, &disk_range_hi)) {
+            if (rej_reason) { *rej_reason = "unreadable .meta sidecar"; }
             return 0; // invariant 4
         }
         if (!(disk_fp == cur_fp)) {
+            if (rej_reason) { *rej_reason = "fingerprint mismatch"; }
             return 0; // invariant 3
         }
         // request-side identity: cell-aligned tokens plus media records (empty on a text-only
@@ -2685,6 +2693,7 @@ private:
             req_media = req.extract_media_records();
         } catch (const std::exception & e) {
             SLT_WRN(slot, "auto-restore: refused, %s\n", e.what());
+            if (rej_reason) { *rej_reason = string_format("media identity: %s", e.what()); }
             return 0;
         }
         // byte-verify: longest common prefix of the persisted cells and the request cells
@@ -2739,6 +2748,7 @@ private:
                 SLT_DBG(slot, "auto-restore: FULL snapshot is not a whole prefix of the request "
                               "(verified %zu of %zu snapshot tokens; request %zu) — skipping %s\n",
                         v, disk_toks.size(), req.size(), cand.state_path.c_str());
+                if (rej_reason) { *rej_reason = string_format("FULL snapshot diverges from request at token %zu of %zu", v, disk_toks.size()); }
                 return 0;
             }
             n_keep_disk = (int) disk_toks.size();
@@ -2757,6 +2767,7 @@ private:
                 SLT_DBG(slot, "auto-restore: SWA snapshot is not a whole prefix of the request "
                               "(verified %zu of %zu snapshot tokens; request %zu, n_swa = %d) - skipping %s\n",
                         v, disk_toks.size(), req.size(), n_swa_mem, cand.state_path.c_str());
+                if (rej_reason) { *rej_reason = string_format("SWA snapshot diverges from request at token %zu of %zu", v, disk_toks.size()); }
                 return 0;
             }
             n_keep_disk = (int) disk_toks.size();
@@ -2778,11 +2789,13 @@ private:
             }
         }
         if (n_keep_disk <= 0) {
+            if (rej_reason) { *rej_reason = "no block-aligned verified prefix"; }
             return 0;
         }
         // MARGIN gate (invariant 5): only pay a multi-GB load if disk strictly beats the
         // in-memory match by at least one block — never thrash a reload to save a few tokens.
         if (n_keep_disk < n_keep_mem + B) {
+            if (rej_reason) { *rej_reason = string_format("in-memory match %d is already within one block of disk match %d", n_keep_mem, n_keep_disk); }
             return 0;
         }
         // ABSOLUTE restore floor (--slot-restore-min-tokens, default 0 = off): skip the multi-GB
@@ -2793,6 +2806,7 @@ private:
         // (which handles "is disk worth more than the resident match") and before the only multi-GB
         // read: return 0 falls through to the caller recomputing n_past + a cold prefill (invariant 4).
         if (n_keep_disk < params_base.slot_restore_min_tokens) {
+            if (rej_reason) { *rej_reason = string_format("verified match %d below --slot-restore-min-tokens", n_keep_disk); }
             return 0;
         }
         // Build the root->tip chain of node .bin paths via the shared walker. Done BEFORE touching
@@ -2804,6 +2818,7 @@ private:
         // tips, and shared with the manual /slots restore path.
         std::vector<std::string> chain;
         if (!auto_build_restore_chain(cand.state_path, disk_toks, disk_parent_id, disk_range_lo, chain)) {
+            if (rej_reason) { *rej_reason = "broken delta chain (missing/corrupt/non-contiguous node)"; }
             return 0;
         }
         // Clear the slot's resident KV before loading the snapshot (mirror the restore-continue safe
@@ -2814,6 +2829,7 @@ private:
 
         if (!do_slot_restore(slot, chain)) {
             // restore failed -> slot seq already cleared by do_slot_restore; caller reprefills (invariant 4).
+            if (rej_reason) { *rej_reason = "state load failed (corrupt/short file, KV capacity, or raced eviction)"; }
             return 0;
         }
         if (!disk_media.empty()) {
@@ -2841,6 +2857,7 @@ private:
                 // let a later find_chunk() throw mid-decode (invariant 4).
                 SLT_WRN(slot, "%s", "auto-restore: rebuilt prompt failed validation; clearing restored state\n");
                 auto_restore_drop(slot);
+                if (rej_reason) { *rej_reason = "rebuilt media prompt failed validation"; }
                 return 0;
             }
         }
@@ -2870,6 +2887,7 @@ private:
                 // downstream pos_min==-1 GGML_ABORT — drop it and cold-prefill instead (invariant 4).
                 SLT_WRN(slot, "%s", "auto-restore: verified prefix is outside the snapshot's SWA window; clearing restored state\n");
                 auto_restore_drop(slot);
+                if (rej_reason) { *rej_reason = "verified prefix outside the snapshot's SWA window"; }
                 return 0;
             }
             slot.prompt.checkpoints.clear();
@@ -6575,7 +6593,10 @@ private:
                                     // FULL model, which needs a whole-prefix match) from shadowing a shorter
                                     // usable one at the same boundary. Media requests look up first-class:
                                     // auto_index_lookup folds each chunk's identity into the boundary hashes.
-                                    for (const auto & cand : auto_index_lookup(input_tokens)) {
+                                    const auto cands = auto_index_lookup(input_tokens);
+                                    int restored = 0;
+                                    std::string rej_summary;
+                                    for (const auto & cand : cands) {
                                         // auto_restore_into_slot may CLEAR the slot
                                         // (KV seq + prompt.tokens) and then have do_slot_restore FAIL
                                         // (corrupt/short .bin, KV-capacity exceeded, racing LRU eviction
@@ -6587,10 +6608,29 @@ private:
                                         // (which would GGML_ASSERT/abort). The recompute is harmless on the
                                         // early-return-before-clear paths (margin/fp/verify rejects): those
                                         // leave prompt.tokens untouched, so the LCP is identical to before.
-                                        const int restored = auto_restore_into_slot(slot, cand, input_tokens, (int) n_past);
+                                        std::string rej_reason;
+                                        restored = auto_restore_into_slot(slot, cand, input_tokens, (int) n_past, &rej_reason);
                                         n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
                                         if (restored > 0) {
                                             break; // restored; stop trying shorter candidates
+                                        }
+                                        if (!rej_summary.empty()) {
+                                            rej_summary += "; ";
+                                        }
+                                        rej_summary += std::filesystem::path(cand.state_path).filename().string();
+                                        rej_summary += ": ";
+                                        rej_summary += rej_reason.empty() ? "rejected" : rej_reason;
+                                    }
+                                    // Per-request restore stats at INFO level (visible without --verbose):
+                                    // how many candidates were considered and why each was not loaded, so a
+                                    // cache that fails to restore is diagnosable from the normal log.
+                                    if (restored == 0) {
+                                        if (cands.empty()) {
+                                            SLT_INF(slot, "auto-restore: no indexed snapshot candidates for this %zu-token request; full prefill\n",
+                                                    input_tokens.size());
+                                        } else {
+                                            SLT_INF(slot, "auto-restore: no usable snapshot among %zu candidate(s) for this %zu-token request [%s]; full prefill\n",
+                                                    cands.size(), input_tokens.size(), rej_summary.c_str());
                                         }
                                     }
                                 }
