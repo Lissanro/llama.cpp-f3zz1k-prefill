@@ -3589,6 +3589,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_SLOT_SAVE_COMPACT").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--slot-save-auto-clean"},
+        {"--no-slot-save-auto-clean"},
+        "on low disk space, evict oldest auto-cache snapshots (least-recently-used first, "
+        "tree-aware, pinned snapshots excluded) to make room for a new save. With auto-clean "
+        "disabled the server instead halts and retries the save until space is freed. Either way "
+        "a snapshot is never skipped silently: the save blocks until it lands (default: enabled)",
+        [](common_params & params, bool value) {
+            params.slot_save_auto_clean = value;
+        }
+    ).set_env("LLAMA_ARG_SLOT_SAVE_AUTO_CLEAN").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--slot-save-block"}, "N",
         string_format("token-ID hash block size for the auto disk cache index; reuse granularity "
                       "is one block (default: %d)", params.slot_save_block),
