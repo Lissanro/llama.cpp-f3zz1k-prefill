@@ -685,7 +685,9 @@ struct common_params {
                                            // of a complete snapshot each time; requires slot_save_auto
     bool    slot_save_compact = true; // when not using --slot-save-incremental, delete shorter
                                       // exact-prefix auto-cache snapshots after a whole save to
-                                      // reclaim disk space; manual saves are never compacted
+                                      // reclaim disk space; manual saves are never compacted; only
+                                      // effective for dense attention models (FULL/SWA keep shorter
+                                      // prefixes: they cannot partially rewind a restore)
     bool    slot_save_auto_clean = true; // on low disk space, evict oldest auto-cache snapshots
                                          // (LRU, tree-aware, pinned excluded) to make room for a new
                                          // save; disabled => halt and retry until space is freed
