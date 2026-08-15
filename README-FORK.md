@@ -92,6 +92,17 @@ upstream.
 | `--slot-save-idle-seconds N` | 60 | Also flush an idle slot to disk after `N` seconds of inactivity, not only when the slot is reused — so a single request survives a restart or is picked up by another instance without waiting for more traffic. `-1` disables. Requires `--slot-save-auto`. |
 | `--slot-save-max-count N` | 0 (unlimited) | Bound the **`--slot-save-auto` cache** to at most `N` snapshots; oldest are deleted first. `0` = unlimited. No effect without `--slot-save-auto`. |
 | `--slot-save-max-mb N` | 0 (unlimited) | Bound the **`--slot-save-auto` cache** to `N` MiB total; oldest deleted first. `0` = unlimited. A single snapshot larger than this is refused (not allowed to wipe the rest). No effect without `--slot-save-auto`. |
+| `--slot-save-auto-clean` / `--no-slot-save-auto-clean` | on | On low disk space, evict oldest auto-cache snapshots (LRU, tree-aware, pinned excluded) to make room for a new save. With auto-clean off, the server instead halts and retries until space is freed. No effect without `--slot-save-auto`. |
+
+> **A save is never skipped silently.** If the disk cannot hold a snapshot the server first
+> evicts old snapshots (unless `--no-slot-save-auto-clean`), then **halts and retries every 5
+> seconds** until space is freed - it never proceeds with the snapshot unsaved and never loses
+> it quietly. Every low-space event, eviction, retry and successful save (with its trigger:
+> idle flush, periodic flush, slot reassign, KV-pressure purge, idle-slot RAM eviction,
+> context shift, shutdown) is logged at INFO/WARN/ERROR level, so it is all visible without
+> `--verbose`. The only way to abandon a pending save is killing the process: a single Ctrl+C
+> still flushes every slot (retrying forever if needed), a **second Ctrl+C exits immediately**,
+> abandoning whatever is mid-save.
 
 > **Eviction is opt-in.** Plain `--slot-save-path` (manual `/slots` save, upstream behaviour)
 > never deletes anything. The bounded LRU store only runs when `--slot-save-auto` owns the

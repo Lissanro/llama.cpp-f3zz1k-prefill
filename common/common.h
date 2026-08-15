@@ -686,6 +686,9 @@ struct common_params {
     bool    slot_save_compact = true; // when not using --slot-save-incremental, delete shorter
                                       // exact-prefix auto-cache snapshots after a whole save to
                                       // reclaim disk space; manual saves are never compacted
+    bool    slot_save_auto_clean = true; // on low disk space, evict oldest auto-cache snapshots
+                                         // (LRU, tree-aware, pinned excluded) to make room for a new
+                                         // save; disabled => halt and retry until space is freed
     int32_t slot_save_block = 256;    // token-ID hash block size (vLLM-APC / SGLang-radix style)
     // minimum snapshot size (in cells/tokens) worth persisting: a trivially small prefix saves
     // little prefill against the state-file write + later restore, so it is skipped. The effective

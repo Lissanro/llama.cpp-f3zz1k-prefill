@@ -34,6 +34,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -429,23 +430,314 @@ static bool slot_save_parse_node_id(const std::string & state_path, uint64_t & n
     return true;
 }
 
+// A node's on-disk identity is the PAIR (chain_hash, n_tokens): a continuation that does not
+// cross a whole-block boundary shares its parent's chain_hash, so chain_hash ALONE would make
+// the child collide with - indeed parent_id == node_id, self-reference - its parent. The parent
+// link is the pair (parent_id, range_lo) - exactly the pair restore feeds to auto_state_filename.
+using slot_save_node_key = std::pair<uint64_t, uint32_t>;
+
+// On-disk view of the auto-cache store: unit enumeration, orphan-delta reaping and tree-aware
+// LRU-leaf eviction, recomputed from the directory on every scan (cross-process correct).
+// Shared by slot_save_enforce_limits (cap-driven eviction) and slot_save_evict_oldest
+// (disk-pressure eviction before a save). `protected_path` (the just-written unit, "" when
+// none) is never evicted.
+//
+// IMPORTANT: eviction runs ONLY for the opt-in --slot-save-auto cache (callers gate on
+// auto_cache_enabled()); a plain manual --slot-save-path save never reaches it and never deletes
+// anything. Under --slot-save-auto the save directory is treated as a server-owned store: any
+// regular file in it (other than recognized "<X>.logits"/"<X>.meta"/"<X>.pin" sidecars and
+// "*.tmp" temporaries) is an eviction candidate. Point the auto cache at a DEDICATED directory;
+// do not mix unrelated files into it. Manual saves (non-"auto-" filenames) are user-owned
+// persistent snapshots: never counted and never evicted.
+//
+// Tree-aware eviction (U5): the auto cache is a FOREST of checkpoint trees, reconstructed purely
+// from what is on disk (no in-RAM tree map). A v1 whole snapshot - or any foreign/manual file -
+// is a parentless root; a v3 delta node points at the parent whose KV prefix it extends. Two
+// rules make eviction tree-correct:
+//   (a) NEVER evict a node that still has a child on disk - its delta .bin is meaningless
+//       without its base - so only LEAVES are evicted, oldest leaf first, peeling a lineage
+//       tip-to-root.
+//   (b) Age every candidate by its OWN mtime. A restore touches EVERY node on the chain it used
+//       (see auto_touch_unit at the restore site), so a live lineage's shared base already has a
+//       fresh mtime of its own and is additionally un-evictable by (a) while any child survives.
+//       An untouched sibling therefore ages out on its own, which is the whole point. (Aging
+//       whole trees by their most-recent node made wide fan-outs immortal: one active fork
+//       refreshed N-1 dead siblings, pushing eviction onto OTHER trees.)
+struct slot_save_store {
+    std::string protected_path;
+    std::vector<slot_save_unit> units;
+    std::vector<char> alive;
+    std::map<slot_save_node_key, size_t> node_by_key;
+    std::map<slot_save_node_key, size_t> child_count;
+    size_t    live_count      = 0; // alive and not pinned
+    uintmax_t live_bytes      = 0; // alive and not pinned
+    uintmax_t this_unit_bytes = 0; // bytes of the protected unit (0 if not on disk)
+    uintmax_t freed_bytes     = 0; // bytes removed during this scan (orphan reaps + evictions)
+
+    static slot_save_node_key self_key(const slot_save_unit & u)   { return { u.node_id,   u.n_tokens }; }
+    static slot_save_node_key parent_key(const slot_save_unit & u) { return { u.parent_id, u.range_lo  }; }
+
+    void remove_unit_files(const slot_save_unit & u) {
+        std::error_code ec;
+        std::filesystem::remove(u.state_path, ec);
+        if (!u.sidecar_path.empty()) {
+            std::filesystem::remove(u.sidecar_path, ec);
+        }
+        if (!u.meta_path.empty()) {
+            std::filesystem::remove(u.meta_path, ec);
+        }
+    }
+
+    // Enumerate `dir` into units (skipping temps, real sidecars and manual saves), reaping
+    // orphaned sidecars and orphan delta nodes (both are dead weight that frees space too),
+    // then build the tree refs and the live count/byte totals. Never throws across the server
+    // loop: only the error_code std::filesystem overloads are used.
+    void scan(const std::string & dir, const std::string & protected_path_in) {
+        protected_path = protected_path_in;
+        std::error_code ec;
+
+        // First pass: enumerate every regular file once and record the full set of paths so we can
+        // tell a real sidecar (sibling of a state file we wrote) from a state file a client happened
+        // to name "foo.logits". We must NOT blindly skip every "*.logits" - fs_validate_filename
+        // allows that suffix, so a state file literally named "foo.logits" would otherwise escape both
+        // caps entirely. Only "<X>.logits" where "<X>" also exists is treated as a sidecar.
+        std::vector<std::string> all_files;
+        {
+            std::set<std::string> present;
+            for (std::filesystem::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+                std::error_code fec;
+                if (!it->is_regular_file(fec) || fec) {
+                    continue;
+                }
+                all_files.push_back(it->path().string());
+                present.insert(all_files.back());
+            }
+
+            for (const std::string & p : all_files) {
+                std::error_code fec;
+                // in-flight temp files are never counted or evicted (a concurrent save owns them). A
+                // save streams its state to "<fname>.<pid>.<nonce>.tmp", then renames the ".logits"/
+                // ".meta" sidecar temps to their final names AFTER renaming that state temp to <fname>;
+                // in that publish window the sidecar temps ("...tmp.logits"/"...tmp.meta") have no base
+                // file, so they must be matched here rather than reaped as orphaned sidecars below.
+                if ((p.size() >= 4  && p.compare(p.size() - 4,  4,  ".tmp")        == 0) ||
+                    (p.size() >= 11 && p.compare(p.size() - 11, 11, ".tmp.logits") == 0) ||
+                    (p.size() >= 9  && p.compare(p.size() - 9,  9,  ".tmp.meta")   == 0)) {
+                    continue;
+                }
+                // a "<X>.logits" file is a sidecar ONLY when its state file "<X>" is also present;
+                // accounted together with that state file below, so skip it here.
+                if (p.size() >= 7 && p.compare(p.size() - 7, 7, ".logits") == 0 &&
+                    present.count(p.substr(0, p.size() - 7))) {
+                    continue;
+                }
+                // a "<X>.meta" file is the auto disk cache's tokens+fingerprint sidecar; treat it
+                // exactly like ".logits" - accounted with its state file below, reaped if orphaned.
+                if (p.size() >= 5 && p.compare(p.size() - 5, 5, ".meta") == 0 &&
+                    present.count(p.substr(0, p.size() - 5))) {
+                    continue;
+                }
+                // a "<X>.pin" file marks "<X>" as PINNED (never evicted, excluded from caps). Like the
+                // other sidecars: skip it here when its state file is present; reaped below if orphaned.
+                if (p.size() >= 4 && p.compare(p.size() - 4, 4, ".pin") == 0 &&
+                    present.count(p.substr(0, p.size() - 4))) {
+                    continue;
+                }
+                // reap an ORPHANED sidecar (its state file was evicted/lost): otherwise these silently
+                // accumulate (we never count them) and eat real on-disk space forever.
+                if (p.size() >= 7 && p.compare(p.size() - 7, 7, ".logits") == 0 &&
+                    !present.count(p.substr(0, p.size() - 7))) {
+                    freed_bytes += std::filesystem::file_size(p, fec);
+                    fec.clear();
+                    std::filesystem::remove(p, fec);
+                    continue;
+                }
+                if (p.size() >= 5 && p.compare(p.size() - 5, 5, ".meta") == 0 &&
+                    !present.count(p.substr(0, p.size() - 5))) {
+                    freed_bytes += std::filesystem::file_size(p, fec);
+                    fec.clear();
+                    std::filesystem::remove(p, fec);
+                    continue;
+                }
+                if (p.size() >= 4 && p.compare(p.size() - 4, 4, ".pin") == 0 &&
+                    !present.count(p.substr(0, p.size() - 4))) {
+                    std::filesystem::remove(p, fec);
+                    continue;
+                }
+
+                // manual /slots saves (non-"auto-" filenames) are user-owned persistent snapshots,
+                // not part of the auto cache's LRU pool: never counted toward the caps and never evicted.
+                // Their orphaned sidecars (.logits/.meta/.pin) are reaped above; the .bin itself is left
+                // alone so a manually saved cache is never wiped by the auto cache's cleanup.
+                if (p.size() >= 4 && p.compare(p.size() - 4, 4, ".bin") == 0) {
+                    const std::string fname = std::filesystem::path(p).filename().string();
+                    if (fname.rfind("auto-", 0) != 0) {
+                        continue;
+                    }
+                }
+
+                slot_save_unit u;
+                u.state_path = p;
+                // PINNED snapshots (a sibling "<state>.pin" marker) are never evicted and are excluded
+                // from the count/byte caps entirely - a reserved, persistent entry (e.g. a permanent
+                // doc / system-prompt prefix) that coexists with the normal LRU pool. Pin with
+                // `touch <snapshot>.pin`; unpin by removing it. The index/restore path is unchanged:
+                // a pinned snapshot is a normal auto-*.bin, still discovered and restored like any other.
+                // We DON'T skip it here (as the flat-LRU version did): it is carried into the unit set so
+                // the tree refcount below counts it as a live child of its parent, which protects a pinned
+                // v3 delta node's whole ancestor chain from eviction (a base whose only child is pinned
+                // must not be reaped). It is then excluded from the caps and never picked for eviction.
+                u.pinned = (present.count(p + ".pin") > 0);
+                u.bytes = std::filesystem::file_size(p, fec);
+                if (fec) {
+                    continue;
+                }
+                const std::string side = p + ".logits";
+                if (present.count(side)) {
+                    const auto sb = std::filesystem::file_size(side, fec);
+                    if (!fec) {
+                        u.sidecar_path = side;
+                        u.bytes += sb;
+                    }
+                }
+                const std::string meta = p + ".meta";
+                if (present.count(meta)) {
+                    const auto mb = std::filesystem::file_size(meta, fec);
+                    if (!fec) {
+                        u.meta_path = meta;
+                        u.bytes += mb;
+                    }
+                }
+                u.mtime = std::filesystem::last_write_time(p, fec);
+                if (fec) {
+                    continue;
+                }
+
+                // Tree identity for U5 eviction: the node's own key (chain_hash, n_tokens) from the filename,
+                // its parent link + range from the .meta. A file with no delta meta (v1 whole snapshot or a
+                // foreign file) stays a parentless root (parent_id 0), so the eviction below reduces to today's
+                // flat mtime LRU for it.
+                slot_save_parse_node_id(p, u.node_id, u.n_tokens);
+                slot_node_meta_probe(p, u.parent_id, u.range_lo, u.range_hi);
+                u.is_node = (u.parent_id != 0);
+
+                if (p == protected_path) {
+                    this_unit_bytes = u.bytes;
+                }
+                units.push_back(std::move(u));
+            }
+        }
+
+        for (size_t i = 0; i < units.size(); ++i) {
+            if (units[i].node_id != 0) {
+                node_by_key[self_key(units[i])] = i;
+            }
+        }
+
+        alive.assign(units.size(), 1);
+
+        // Reap orphan deltas up front: a delta node whose base file is gone can never be restored (a
+        // base-less delta .bin would corrupt a compose-load), so it is dead weight - delete it regardless
+        // of the caps. Evicting one orphan can orphan its own children, so iterate to a fixed point.
+        // protected_path is never touched (a freshly saved node had its parent verified present at save
+        // time).
+        for (bool changed = true; changed; ) {
+            changed = false;
+            for (size_t i = 0; i < units.size(); ++i) {
+                // never reap a pinned node's files (its .pin is authoritative "keep"); it stays alive so
+                // its own children are not treated as orphaned either.
+                if (!alive[i] || units[i].parent_id == 0 || units[i].pinned ||
+                    units[i].state_path == protected_path) {
+                    continue;
+                }
+                const auto it = node_by_key.find(parent_key(units[i]));
+                if (it == node_by_key.end() || !alive[it->second]) {
+                    SRV_INF("auto-save: reaping orphan delta %s (its base snapshot is missing)\n",
+                            units[i].state_path.c_str());
+                    freed_bytes += units[i].bytes;
+                    remove_unit_files(units[i]);
+                    alive[i] = 0;
+                    if (units[i].node_id != 0) {
+                        const auto self = node_by_key.find(self_key(units[i]));
+                        if (self != node_by_key.end() && self->second == i) {
+                            node_by_key.erase(self);
+                        }
+                    }
+                    changed = true;
+                }
+            }
+        }
+
+        // child_count[(chain_hash, n_tokens)] = live children of that node (a node is a LEAF iff
+        // child_count[self_key] == 0).
+        for (size_t i = 0; i < units.size(); ++i) {
+            if (alive[i] && units[i].parent_id != 0) {
+                child_count[parent_key(units[i])]++;
+            }
+        }
+
+        // Pinned units are excluded from the caps entirely - they occupy the tree only so their ancestors
+        // stay refcount-protected - matching the flat-LRU pin semantics (a pinned unit was uncounted there).
+        for (size_t i = 0; i < units.size(); ++i) {
+            if (alive[i] && !units[i].pinned) {
+                live_count++;
+                live_bytes += units[i].bytes;
+            }
+        }
+    }
+
+    // Pick the least-recently-used evictable leaf, by its OWN mtime (rule (b) above). Returns
+    // units.size() when nothing is evictable (every remaining node has a live child, is pinned,
+    // or is protected_path).
+    size_t pick_leaf() const {
+        size_t best = units.size();
+        for (size_t i = 0; i < units.size(); ++i) {
+            if (!alive[i] || units[i].pinned || units[i].state_path == protected_path) {
+                continue; // pinned units are never evicted
+            }
+            if (units[i].node_id != 0) {
+                const auto cc = child_count.find(self_key(units[i]));
+                if (cc != child_count.end() && cc->second > 0) {
+                    continue; // not a leaf: a delta still depends on it (rule (a))
+                }
+            }
+            if (best == units.size() || units[i].mtime < units[best].mtime) {
+                best = i;
+            }
+        }
+        return best;
+    }
+
+    // Evict the picked leaf (delete its files, update the tree refs). False when nothing is
+    // evictable.
+    bool evict_leaf() {
+        const size_t i = pick_leaf();
+        if (i == units.size()) {
+            return false;
+        }
+        SRV_INF("auto-save: evicted oldest snapshot %s (%llu bytes)\n",
+                units[i].state_path.c_str(), (unsigned long long) units[i].bytes);
+        freed_bytes += units[i].bytes;
+        remove_unit_files(units[i]);
+        alive[i] = 0;
+        live_bytes -= std::min(live_bytes, (uintmax_t) units[i].bytes);
+        live_count  = (live_count > 0) ? live_count - 1 : 0;
+        if (units[i].parent_id != 0) { // evicting a leaf may expose its parent as a new leaf
+            const auto it = child_count.find(parent_key(units[i]));
+            if (it != child_count.end() && it->second > 0) {
+                it->second--;
+            }
+        }
+        return true;
+    }
+};
+
 // Enforce --slot-save-max-count / --slot-save-max-bytes over `dir` using LRU-by-mtime eviction.
 // `just_written` is the state path that was just saved: it is never evicted, but if it ALONE
 // exceeds the byte cap it is deleted (with its sidecar) and `oversized` is set so the caller can
-// reject the save rather than evict everything else. Operates strictly within `dir`; uses only
-// the error_code std::filesystem overloads so it never throws across the server loop.
-//
-// IMPORTANT: this runs ONLY for the opt-in --slot-save-auto cache (callers gate on
-// auto_cache_enabled()); a plain manual --slot-save-path save never reaches it and never deletes
-// anything. When a cap is set on the auto cache, --slot-save-path is treated as a server-owned
-// store — any regular file in it (other than recognized "<X>.logits" sidecars and "*.tmp"
-// temporaries) is an eviction candidate. Point --slot-save-max-count/-mb at a DEDICATED directory;
-// do not mix unrelated files into the auto-cache directory. (With no caps set — the default —
-// nothing is ever deleted and the directory is left exactly as before.)
-// `just_written` is the exact filepath string the server built as `slot_save_path + filename`;
-// directory_iterator(dir) over that same `slot_save_path` yields identically-spelled path strings
-// on POSIX (the production target), so raw string equality correctly identifies the just-saved
-// unit. (Not used on Windows in practice; if ever needed there, switch to filename comparison.)
+// reject the save rather than evict everything else. (With no caps set - the default - nothing
+// is ever deleted by this path; the disk-pressure eviction before a save is separate, see
+// slot_save_evict_oldest.)
 static void slot_save_enforce_limits(const std::string & dir,
                                      int32_t max_count, int64_t max_bytes,
                                      const std::string & just_written,
@@ -455,152 +747,17 @@ static void slot_save_enforce_limits(const std::string & dir,
         return; // both unlimited
     }
 
-    std::error_code ec;
-    std::vector<slot_save_unit> units;
-    uintmax_t this_unit_bytes = 0;
-
-    // First pass: enumerate every regular file once and record the full set of paths so we can
-    // tell a real sidecar (sibling of a state file we wrote) from a state file a client happened
-    // to name "foo.logits". We must NOT blindly skip every "*.logits" — fs_validate_filename
-    // allows that suffix, so a state file literally named "foo.logits" would otherwise escape both
-    // caps entirely. Only "<X>.logits" where "<X>" also exists is treated as a sidecar.
-    std::vector<std::string> all_files;
-    {
-        std::set<std::string> present;
-        for (std::filesystem::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
-            std::error_code fec;
-            if (!it->is_regular_file(fec) || fec) {
-                continue;
-            }
-            all_files.push_back(it->path().string());
-            present.insert(all_files.back());
-        }
-
-        for (const std::string & p : all_files) {
-            std::error_code fec;
-            // in-flight temp files are never counted or evicted (a concurrent save owns them). A
-            // save streams its state to "<fname>.<pid>.<nonce>.tmp", then renames the ".logits"/
-            // ".meta" sidecar temps to their final names AFTER renaming that state temp to <fname>;
-            // in that publish window the sidecar temps ("…tmp.logits"/"…tmp.meta") have no base
-            // file, so they must be matched here rather than reaped as orphaned sidecars below.
-            if ((p.size() >= 4  && p.compare(p.size() - 4,  4,  ".tmp")        == 0) ||
-                (p.size() >= 11 && p.compare(p.size() - 11, 11, ".tmp.logits") == 0) ||
-                (p.size() >= 9  && p.compare(p.size() - 9,  9,  ".tmp.meta")   == 0)) {
-                continue;
-            }
-            // a "<X>.logits" file is a sidecar ONLY when its state file "<X>" is also present;
-            // accounted together with that state file below, so skip it here.
-            if (p.size() >= 7 && p.compare(p.size() - 7, 7, ".logits") == 0 &&
-                present.count(p.substr(0, p.size() - 7))) {
-                continue;
-            }
-            // a "<X>.meta" file is the auto disk cache's tokens+fingerprint sidecar; treat it
-            // exactly like ".logits" — accounted with its state file below, reaped if orphaned.
-            if (p.size() >= 5 && p.compare(p.size() - 5, 5, ".meta") == 0 &&
-                present.count(p.substr(0, p.size() - 5))) {
-                continue;
-            }
-            // a "<X>.pin" file marks "<X>" as PINNED (never evicted, excluded from caps). Like the
-            // other sidecars: skip it here when its state file is present; reaped below if orphaned.
-            if (p.size() >= 4 && p.compare(p.size() - 4, 4, ".pin") == 0 &&
-                present.count(p.substr(0, p.size() - 4))) {
-                continue;
-            }
-            // reap an ORPHANED sidecar (its state file was evicted/lost): otherwise these silently
-            // accumulate (we never count them) and eat real on-disk space forever.
-            if (p.size() >= 7 && p.compare(p.size() - 7, 7, ".logits") == 0 &&
-                !present.count(p.substr(0, p.size() - 7))) {
-                std::filesystem::remove(p, fec);
-                continue;
-            }
-            if (p.size() >= 5 && p.compare(p.size() - 5, 5, ".meta") == 0 &&
-                !present.count(p.substr(0, p.size() - 5))) {
-                std::filesystem::remove(p, fec);
-                continue;
-            }
-            if (p.size() >= 4 && p.compare(p.size() - 4, 4, ".pin") == 0 &&
-                !present.count(p.substr(0, p.size() - 4))) {
-                std::filesystem::remove(p, fec);
-                continue;
-            }
-
-            // manual /slots saves (non-"auto-" filenames) are user-owned persistent snapshots,
-            // not part of the auto cache's LRU pool: never counted toward the caps and never evicted.
-            // Their orphaned sidecars (.logits/.meta/.pin) are reaped above; the .bin itself is left
-            // alone so a manually saved cache is never wiped by the auto cache's cleanup.
-            if (p.size() >= 4 && p.compare(p.size() - 4, 4, ".bin") == 0) {
-                const std::string fname = std::filesystem::path(p).filename().string();
-                if (fname.rfind("auto-", 0) != 0) {
-                    continue;
-                }
-            }
-
-            slot_save_unit u;
-            u.state_path = p;
-            // PINNED snapshots (a sibling "<state>.pin" marker) are never evicted and are excluded
-            // from the count/byte caps entirely — a reserved, persistent entry (e.g. a permanent
-            // doc / system-prompt prefix) that coexists with the normal LRU pool. Pin with
-            // `touch <snapshot>.pin`; unpin by removing it. The index/restore path is unchanged:
-            // a pinned snapshot is a normal auto-*.bin, still discovered and restored like any other.
-            // We DON'T skip it here (as the flat-LRU version did): it is carried into the unit set so
-            // the tree refcount below counts it as a live child of its parent, which protects a pinned
-            // v3 delta node's whole ancestor chain from eviction (a base whose only child is pinned
-            // must not be reaped). It is then excluded from the caps and never picked for eviction.
-            u.pinned = (present.count(p + ".pin") > 0);
-            u.bytes = std::filesystem::file_size(p, fec);
-            if (fec) {
-                continue;
-            }
-            const std::string side = p + ".logits";
-            if (present.count(side)) {
-                const auto sb = std::filesystem::file_size(side, fec);
-                if (!fec) {
-                    u.sidecar_path = side;
-                    u.bytes += sb;
-                }
-            }
-            const std::string meta = p + ".meta";
-            if (present.count(meta)) {
-                const auto mb = std::filesystem::file_size(meta, fec);
-                if (!fec) {
-                    u.meta_path = meta;
-                    u.bytes += mb;
-                }
-            }
-            u.mtime = std::filesystem::last_write_time(p, fec);
-            if (fec) {
-                continue;
-            }
-
-            // Tree identity for U5 eviction: the node's own key (chain_hash, n_tokens) from the filename,
-            // its parent link + range from the .meta. A file with no delta meta (v1 whole snapshot or a
-            // foreign file) stays a parentless root (parent_id 0), so the eviction below reduces to today's
-            // flat mtime LRU for it.
-            slot_save_parse_node_id(p, u.node_id, u.n_tokens);
-            slot_node_meta_probe(p, u.parent_id, u.range_lo, u.range_hi);
-            u.is_node = (u.parent_id != 0);
-
-            if (p == just_written) {
-                this_unit_bytes = u.bytes;
-            }
-            units.push_back(std::move(u));
-        }
-    }
+    slot_save_store store;
+    store.scan(dir, just_written);
 
     // a single snapshot larger than the byte cap is rejected: delete only the just-written unit,
     // do NOT cascade-evict every other (valid) snapshot to make room for something that can't fit.
     // NOTE: intentionally a no-op when max_bytes == 0 (byte cap disabled); in count-only mode an
-    // individual snapshot's size is never bounded — only --slot-save-max-mb bounds per-snapshot size.
-    if (max_bytes > 0 && this_unit_bytes > (uintmax_t) max_bytes) {
-        for (const auto & u : units) {
+    // individual snapshot's size is never bounded - only --slot-save-max-mb bounds per-snapshot size.
+    if (max_bytes > 0 && store.this_unit_bytes > (uintmax_t) max_bytes) {
+        for (const auto & u : store.units) {
             if (u.state_path == just_written) {
-                std::filesystem::remove(u.state_path, ec);
-                if (!u.sidecar_path.empty()) {
-                    std::filesystem::remove(u.sidecar_path, ec);
-                }
-                if (!u.meta_path.empty()) {
-                    std::filesystem::remove(u.meta_path, ec);
-                }
+                store.remove_unit_files(u);
                 break;
             }
         }
@@ -608,154 +765,9 @@ static void slot_save_enforce_limits(const std::string & dir,
         return;
     }
 
-    // ---- Tree-aware eviction (U5) --------------------------------------------------------------------
-    // The auto cache is a FOREST of checkpoint trees, reconstructed here purely from what is on disk (no
-    // in-RAM tree map). A v1 whole snapshot — or any foreign/manual file — is a parentless root; a v3
-    // delta node points at the parent whose KV prefix it extends (parent_id == the parent file's
-    // chain-hash == its filename's middle hex). Two rules make eviction tree-correct:
-    //   (a) NEVER evict a node that still has a child on disk — its delta .bin is meaningless without its
-    //       base — so we only ever evict LEAVES (child_count[node_id] == 0), oldest leaf first, which
-    //       peels a lineage tip-to-root.
-    //   (b) Age every candidate by its OWN mtime. A restore touches EVERY node on the chain it used
-    //       (see auto_touch_unit at the restore site), so a live lineage's shared base already has a
-    //       fresh mtime of its own and is additionally un-evictable by (a) while any child survives.
-    //       An untouched sibling therefore ages out on its own, which is the whole point.
-    //
-    // NOTE: this deliberately REPLACES a previous `tree_recency` rule that aged whole TREES by their
-    // most-recent node. That rule was redundant with (a) + chain-propagating touch for its stated goal
-    // ("a hot lineage keeps its cold shared base"), and it actively broke the fan-out case it was
-    // supposed to help: with N subagent forks off one shared prefix, a single active fork refreshed
-    // the whole tree's recency and made all N-1 dead forks immortal, so eviction pressure fell on
-    // OTHER trees instead — a wide fan-out could evict the entire rest of the store. It also let a
-    // single synthetic warm-on-spawn restore (which touches the chain) immunise a lineage that had
-    // seen no real traffic for days. Measured on the live store: 21 sibling tips off one root, median
-    // leaf age 82.5 h, shielded by a tree_recency of 2.0 h that came from the boot-time warm read.
-    // Recomputed from disk each pass => cross-process correct.
-
-    auto remove_unit_files = [&](const slot_save_unit & u) {
-        std::filesystem::remove(u.state_path, ec);
-        if (!u.sidecar_path.empty()) {
-            std::filesystem::remove(u.sidecar_path, ec);
-        }
-        if (!u.meta_path.empty()) {
-            std::filesystem::remove(u.meta_path, ec);
-        }
-    };
-
-    // A node's on-disk identity is the PAIR (chain_hash, n_tokens): a continuation that does not cross a
-    // whole-block boundary shares its parent's chain_hash, so chain_hash ALONE would make the child
-    // collide with — indeed parent_id == node_id, self-reference — its parent, pinning the true tip as
-    // unevictable and defeating the caps. n_tokens (from the filename) disambiguates. The parent link is
-    // the pair (parent_id, range_lo) — exactly the pair U4 restore feeds to auto_state_filename.
-    using node_key = std::pair<uint64_t, uint32_t>; // (chain_hash, n_tokens)
-    const auto self_key   = [](const slot_save_unit & u) -> node_key { return { u.node_id,   u.n_tokens }; };
-    const auto parent_key = [](const slot_save_unit & u) -> node_key { return { u.parent_id, u.range_lo  }; };
-
-    // (chain_hash, n_tokens) -> index, for parent-link resolution. Auto filenames are unique per pair; a
-    // non-auto file has node_id 0 and is never a parent target.
-    std::map<node_key, size_t> node_by_key;
-    for (size_t i = 0; i < units.size(); ++i) {
-        if (units[i].node_id != 0) {
-            node_by_key[self_key(units[i])] = i;
-        }
-    }
-
-    std::vector<char> alive(units.size(), 1);
-
-    // Reap orphan deltas up front: a delta node whose base file is gone can never be restored (a base-less
-    // delta .bin would corrupt a compose-load), so it is dead weight — delete it regardless of the caps.
-    // Evicting one orphan can orphan its own children, so iterate to a fixed point. just_written is never
-    // touched (a freshly saved node had its parent verified present at save time).
-    for (bool changed = true; changed; ) {
-        changed = false;
-        for (size_t i = 0; i < units.size(); ++i) {
-            // never reap a pinned node's files (its .pin is authoritative "keep"); it stays alive so
-            // its own children are not treated as orphaned either.
-            if (!alive[i] || units[i].parent_id == 0 || units[i].pinned ||
-                units[i].state_path == just_written) {
-                continue;
-            }
-            const auto it = node_by_key.find(parent_key(units[i]));
-            if (it == node_by_key.end() || !alive[it->second]) {
-                remove_unit_files(units[i]);
-                alive[i] = 0;
-                if (units[i].node_id != 0) {
-                    const auto self = node_by_key.find(self_key(units[i]));
-                    if (self != node_by_key.end() && self->second == i) {
-                        node_by_key.erase(self);
-                    }
-                }
-                changed = true;
-            }
-        }
-    }
-
-    // child_count[(chain_hash, n_tokens)] = live children of that node (a node is a LEAF iff
-    // child_count[self_key] == 0).
-    std::map<node_key, size_t> child_count;
-    for (size_t i = 0; i < units.size(); ++i) {
-        if (alive[i] && units[i].parent_id != 0) {
-            child_count[parent_key(units[i])]++;
-        }
-    }
-
-    // Pinned units are excluded from the caps entirely — they occupy the tree only so their ancestors
-    // stay refcount-protected — matching the flat-LRU pin semantics (a pinned unit was uncounted there).
-    size_t    count = 0;
-    uintmax_t total = 0;
-    for (size_t i = 0; i < units.size(); ++i) {
-        if (alive[i] && !units[i].pinned) {
-            count++;
-            total += units[i].bytes;
-        }
-    }
-
-    // Pick the least-recently-used evictable leaf, by its OWN mtime. Returns units.size() when nothing
-    // is evictable (every remaining node has a live child, or all that is left is just_written).
-    auto pick_leaf = [&]() -> size_t {
-        size_t best = units.size();
-        for (size_t i = 0; i < units.size(); ++i) {
-            if (!alive[i] || units[i].pinned || units[i].state_path == just_written) {
-                continue; // pinned units are never evicted
-            }
-            if (units[i].node_id != 0) {
-                const auto cc = child_count.find(self_key(units[i]));
-                if (cc != child_count.end() && cc->second > 0) {
-                    continue; // not a leaf: a delta still depends on it
-                }
-            }
-            if (best == units.size()) {
-                best = i;
-                continue;
-            }
-            if (units[i].mtime < units[best].mtime) {
-                best = i;
-            }
-        }
-        return best;
-    };
-
-    auto evict_leaf = [&]() -> bool {
-        const size_t i = pick_leaf();
-        if (i == units.size()) {
-            return false;
-        }
-        remove_unit_files(units[i]);
-        alive[i] = 0;
-        total -= std::min(total, (uintmax_t) units[i].bytes);
-        count = (count > 0) ? count - 1 : 0;
-        if (units[i].parent_id != 0) { // evicting a leaf may expose its parent as a new leaf
-            const auto it = child_count.find(parent_key(units[i]));
-            if (it != child_count.end() && it->second > 0) {
-                it->second--;
-            }
-        }
-        return true;
-    };
-
     if (max_count > 0) {
-        while (count > (size_t) max_count) {
-            if (!evict_leaf()) {
+        while (store.live_count > (size_t) max_count) {
+            if (!store.evict_leaf()) {
                 SRV_WRN("%s", "slot-save cache is over --slot-save-max-count but every remaining snapshot "
                               "has a live child delta; leaving it above the limit\n");
                 break;
@@ -763,14 +775,26 @@ static void slot_save_enforce_limits(const std::string & dir,
         }
     }
     if (max_bytes > 0) {
-        while (total > (uintmax_t) max_bytes) {
-            if (!evict_leaf()) {
+        while (store.live_bytes > (uintmax_t) max_bytes) {
+            if (!store.evict_leaf()) {
                 SRV_WRN("%s", "slot-save cache is over --slot-save-max-bytes but every remaining snapshot "
                               "has a live child delta; leaving it above the limit\n");
                 break;
             }
         }
     }
+}
+
+// Evict the single least-recently-used auto-cache unit in `dir` to make room for a new save
+// (orphan deltas and orphaned sidecars are reaped by the scan as well and also free space).
+// Returns the total bytes freed by this call; 0 means nothing is evictable (all remaining units
+// are pinned or parents of live deltas) - the caller then halts and retries until the operator
+// frees disk space.
+static uintmax_t slot_save_evict_oldest(const std::string & dir, const std::string & protected_path) {
+    slot_save_store store;
+    store.scan(dir, protected_path);
+    store.evict_leaf();
+    return store.freed_bytes;
 }
 
 // ---------------------------------------------------------------------------
@@ -3105,23 +3129,15 @@ private:
                                           : llama_tokens(toks.begin(), toks.begin() + hi);
         const llama_tokens & snap_toks  = ((size_t) hi == toks.size()) ? toks : snap_owned;
 
-        // capacity pre-flight (statvfs via std::filesystem::space): refuse to START a multi-GB
-        // write the filesystem cannot hold — on btrfs an ENOSPC mid-write can flip the whole
-        // filesystem read-only, a far worse failure than a skipped opportunistic save. Exact
-        // state size + the token array, with 10% slack covering the file header and the
-        // .logits/.meta sidecars. An unanswerable space query skips too (conservative;
-        // invariant 4: a skipped save never affects generation).
-        {
-            const size_t sz_state = llama_state_seq_get_size(ctx, slot.id);
-            const size_t sz_need  = sz_state + snap_toks.size() * sizeof(llama_token);
-            std::error_code sec;
-            const auto sinfo = std::filesystem::space(params_base.slot_save_path, sec);
-            if (sec || sinfo.available < sz_need + sz_need / 10) {
-                SLT_DBG(slot, "auto-save: skipped, insufficient free space (need %zu bytes + 10%% slack, available %zu)\n",
-                        sz_need, sec ? 0 : (size_t) sinfo.available);
-                return;
-            }
-        }
+        // A snapshot worth saving MUST be saved - never skipped silently. On insufficient free
+        // space the save first evicts oldest auto-cache snapshots (LRU, tree-aware, pin-respect;
+        // disabled by --no-slot-save-auto-clean), then halts and retries until the operator frees
+        // disk space. Halting blocks the server loop on purpose: proceeding without saving is
+        // exactly the silent data loss this path exists to prevent. The only way to abandon the
+        // save is killing the process (a second Ctrl+C exits outright from the signal handler).
+        // Transient mid-write I/O failures retry the whole attempt for the same reason.
+        const size_t sz_state = llama_state_seq_get_size(ctx, slot.id);
+        const size_t sz_need  = sz_state + snap_toks.size() * sizeof(llama_token);
 
         const std::string fname = auto_state_filename(hash, snap_toks.size());
         // cross-process atomicity: the temp path MUST be unique per writer. The final
@@ -3133,155 +3149,227 @@ private:
         // content). The sidecar temps derive from this same unique base so they are unique too.
         // (nonce is atomic so it stays correct if save I/O is later threaded.)
         static std::atomic<uint64_t> s_tmp_nonce{0};
-        const uint64_t nonce = s_tmp_nonce.fetch_add(1, std::memory_order_relaxed);
-        const std::string tmp = fname + "." + std::to_string((long) getpid()) + "." +
-                                std::to_string(nonce) + ".tmp";
 
-        // 1) write the state to a per-writer-unique temp path (atomic via rename below). NOTE:
-        //    llama_state_seq_save_file writes in place, so we write to the unique temp then rename — a
-        //    crash mid-write never leaves a corrupt state file the index would trust.
-        //    A DELTA node (lo > 0) writes only cells [lo, N) via the range save; a PARTIAL root
-        //    (checkpoint, hi < N) writes cells [0, hi) via the range save; the WHOLE root takes the
-        //    byte-identical save_file path.
-        size_t nwrite;
-        // P0.1: a class that does not honour ranges must never publish a delta. Probe once, here,
-        // where real resident state exists and the range save is about to happen anyway.
+        // P0.1: a class that does not honour ranges must never publish a delta. (Correctness gate,
+        // not a transient failure: refuse without retry.)
         if (is_node && delta_capable == delta_cap::no) {
             return; // fail closed: this instance only writes whole roots
         }
-        if (is_node) {
-            // U5 (mm-delta decision 1): the range save filters by POSITION, so the boundary is
-            // slot.prompt.tokens.pos_next(parent_hi) — the same function that assigned the cell
-            // positions (mtmd decode seeds on pos_next). For text pos_next == parent_hi (byte-identical
-            // delta); for media the two differ and pos_next is the correct boundary.
-            nwrite = llama_state_seq_save_file_range(ctx, tmp.c_str(), slot.id,
-                                                     slot.prompt.tokens.pos_next((llama_pos) lo), -1,
-                                                     snap_toks.data(), snap_toks.size());
-        } else if ((size_t) hi == toks.size()) {
-            nwrite = llama_state_seq_save_file(ctx, tmp.c_str(), slot.id, snap_toks.data(), snap_toks.size());
-        } else {
-            nwrite = llama_state_seq_save_file_range(ctx, tmp.c_str(), slot.id,
-                                                     0, (llama_pos) hi, snap_toks.data(), snap_toks.size());
-        }
-        if (nwrite == 0) {
-            std::error_code ec; std::filesystem::remove(tmp, ec);
-            return; // invariant 4: disk full / IO error -> generation unaffected
-        }
 
-        // P0.1: resolve the probe on the FIRST delta write. Cost: one extra whole-sequence write,
-        // once per instance. If the range was ignored the two byte counts match (the "delta" is a
-        // whole save wearing a delta's .meta) and composing it would duplicate cells -> refuse, and
-        // never attempt a delta again on this instance.
-        if (is_node && delta_capable == delta_cap::unknown) {
-            const std::string probe = tmp + ".probe";
-            const size_t nwhole = llama_state_seq_save_file(ctx, probe.c_str(), slot.id,
-                                                            snap_toks.data(), snap_toks.size());
-            std::error_code pec; std::filesystem::remove(probe, pec);
-            if (nwhole == 0) {
-                std::error_code ec; std::filesystem::remove(tmp, ec);
-                return; // could not probe; try again on the next save rather than guess
+        bool wait_warned = false;
+        for (;;) {
+            // capacity pre-flight (statvfs via std::filesystem::space): on btrfs an ENOSPC
+            // mid-write can flip the whole filesystem read-only, so never START a multi-GB
+            // write the filesystem cannot hold. Exact state size + the token array, with 10%
+            // slack covering the file header and the .logits/.meta sidecars.
+            for (;;) {
+                std::error_code sec;
+                const auto sinfo = std::filesystem::space(params_base.slot_save_path, sec);
+                if (!sec && sinfo.available >= sz_need + sz_need / 10) {
+                    break;
+                }
+                const size_t avail = sec ? 0 : (size_t) sinfo.available;
+                if (params_base.slot_save_auto_clean) {
+                    const uintmax_t freed = slot_save_evict_oldest(params_base.slot_save_path, fname);
+                    if (freed > 0) {
+                        SLT_WRN(slot, "auto-save: low disk space (need %zu bytes + 10%% slack, available %zu); "
+                                      "evicted %llu bytes of old snapshots, retrying\n",
+                                sz_need, avail, (unsigned long long) freed);
+                        continue;
+                    }
+                }
+                if (!wait_warned) {
+                    wait_warned = true;
+                    if (params_base.slot_save_auto_clean) {
+                        SLT_ERR(slot, "auto-save: insufficient free space (need %zu bytes + 10%% slack, available %zu%s) "
+                                      "and no evictable cache snapshots remain (all pinned or parents of live deltas); "
+                                      "halting until space is freed (retrying every 5 s; free disk space or press Ctrl+C twice to abandon the save)\n",
+                                sz_need, avail, sec ? " (space query failed)" : "");
+                    } else {
+                        SLT_ERR(slot, "auto-save: insufficient free space (need %zu bytes + 10%% slack, available %zu%s) "
+                                      "and --no-slot-save-auto-clean is set; "
+                                      "halting until space is freed (retrying every 5 s; free disk space or press Ctrl+C twice to abandon the save)\n",
+                                sz_need, avail, sec ? " (space query failed)" : "");
+                    }
+                } else {
+                    SLT_WRN(slot, "auto-save: still waiting for free space (need %zu bytes, available %zu)\n",
+                            sz_need, avail);
+                }
+                std::this_thread::sleep_for(std::chrono::seconds(5));
             }
-            delta_capable = (nwrite < nwhole) ? delta_cap::yes : delta_cap::no;
-            SRV_INF("auto disk cache: delta capability probed = %s (range %zu B vs whole %zu B)\n",
-                    delta_capable == delta_cap::yes ? "YES" : "NO (whole roots only)", nwrite, nwhole);
-            if (delta_capable == delta_cap::no) {
-                std::error_code ec; std::filesystem::remove(tmp, ec);
-                return;
-            }
-        }
+            wait_warned = false; // re-arm for the next attempt
 
-        // P0.4: refuse to publish a snapshot with NO memory payload. llama_kv_cache::state_write and
-        // state_read are SILENT NO-OPS when the cache is a shared view (`if (other) return;`,
-        // src/llama-kv-cache.cpp:2125-2127 / :2204-2206) — as on LLM_ARCH_GEMMA4_ASSISTANT, whose
-        // sub-caches both carry mem_other. llama_state_seq_save_file still returns nwrite > 0 (file
-        // header + token array), so the existing nwrite==0 gate passes, the .meta claims N tokens,
-        // and a later restore loads NOTHING while reporting success. Class-agnostic guard: a real
-        // snapshot must be substantially larger than its own header + token array. (The early return
-        // in the engine is CORRECT for a pure view sharing v_cells_impl — we refuse the empty
-        // SNAPSHOT, never the model.)
-        {
-            const size_t hdr_and_toks = 256 + snap_toks.size() * sizeof(llama_token);
-            if (nwrite <= hdr_and_toks) {
-                SRV_WRN("auto disk cache: refusing to publish a snapshot with no memory payload "
-                        "(%zu B for %zu tokens) - the memory type serialised nothing\n",
-                        nwrite, snap_toks.size());
-                std::error_code ec; std::filesystem::remove(tmp, ec);
-                return;
-            }
-        }
-        // 1b) U6 (mm-delta decision 4): a range-save delta selects suffix cells by POSITION, so a
-        //     mid-chunk anomaly could leave the boundary value right yet silently drop/duplicate suffix
-        //     cells — and restore's byte-verify is NULL-blind. Peek the delta .bin's serialized cell
-        //     count (no multi-GB load) and require it to equal N - parent_hi. On any mismatch do NOT
-        //     persist a corrupt delta: discard and fall back to a WHOLE save of this exact prefix
-        //     (is_node cleared => the meta below is v1/v2 by `media`, byte-identical to a no-parent save).
-        if (is_node) {
-            uint32_t written_cells = 0;
-            const bool ok = delta_bin_cell_count(tmp, snap_toks.size(), written_cells) &&
-                            (size_t) written_cells == snap_toks.size() - parent_hi;
-            if (!ok) {
-                SLT_WRN(slot, "auto-save: delta cell-count check failed (expected %zu, got %u); "
-                              "falling back to a whole snapshot\n",
-                        snap_toks.size() - parent_hi, written_cells);
-                std::error_code ec; std::filesystem::remove(tmp, ec);
-                is_node   = false;
-                parent_id = 0;
-                parent_hi = 0;
+            const uint64_t nonce = s_tmp_nonce.fetch_add(1, std::memory_order_relaxed);
+            const std::string tmp = fname + "." + std::to_string((long) getpid()) + "." +
+                                    std::to_string(nonce) + ".tmp";
+
+            // 1) write the state to the per-writer-unique temp path (atomic via rename below). NOTE:
+            //    llama_state_seq_save_file writes in place, so we write to the unique temp then rename - a
+            //    crash mid-write never leaves a corrupt state file the index would trust.
+            //    A DELTA node (lo > 0) writes only cells [lo, N) via the range save; a PARTIAL root
+            //    (checkpoint, hi < N) writes cells [0, hi) via the range save; the WHOLE root takes the
+            //    byte-identical save_file path.
+            size_t nwrite;
+            if (is_node) {
+                // U5 (mm-delta decision 1): the range save filters by POSITION, so the boundary is
+                // slot.prompt.tokens.pos_next(parent_hi) - the same function that assigned the cell
+                // positions (mtmd decode seeds on pos_next). For text pos_next == parent_hi (byte-identical
+                // delta); for media the two differ and pos_next is the correct boundary.
+                nwrite = llama_state_seq_save_file_range(ctx, tmp.c_str(), slot.id,
+                                                         slot.prompt.tokens.pos_next((llama_pos) lo), -1,
+                                                         snap_toks.data(), snap_toks.size());
+            } else if ((size_t) hi == toks.size()) {
                 nwrite = llama_state_seq_save_file(ctx, tmp.c_str(), slot.id, snap_toks.data(), snap_toks.size());
-                if (nwrite == 0) {
-                    std::filesystem::remove(tmp, ec);
-                    return; // invariant 4
+            } else {
+                nwrite = llama_state_seq_save_file_range(ctx, tmp.c_str(), slot.id,
+                                                         0, (llama_pos) hi, snap_toks.data(), snap_toks.size());
+            }
+            if (nwrite == 0) {
+                std::error_code ec; std::filesystem::remove(tmp, ec);
+                SLT_WRN(slot, "%s", "auto-save: state write failed (disk full / I/O error); retrying\n");
+                std::this_thread::sleep_for(std::chrono::seconds(5));
+                continue;
+            }
+
+            // P0.1: resolve the probe on the FIRST delta write. Cost: one extra whole-sequence write,
+            // once per instance. If the range was ignored the two byte counts match (the "delta" is a
+            // whole save wearing a delta's .meta) and composing it would duplicate cells -> refuse, and
+            // never attempt a delta again on this instance.
+            if (is_node && delta_capable == delta_cap::unknown) {
+                const std::string probe = tmp + ".probe";
+                const size_t nwhole = llama_state_seq_save_file(ctx, probe.c_str(), slot.id,
+                                                                snap_toks.data(), snap_toks.size());
+                std::error_code pec; std::filesystem::remove(probe, pec);
+                if (nwhole == 0) {
+                    // could not probe (I/O failure writing the probe): do not guess - write this
+                    // prefix WHOLE instead (the same fallback the U6 cell-count check uses) and
+                    // leave delta_capable unknown so a later save retries the probe.
+                    SLT_WRN(slot, "%s", "auto-save: delta capability probe failed; falling back to a whole snapshot\n");
+                    std::error_code ec; std::filesystem::remove(tmp, ec);
+                    is_node   = false;
+                    parent_id = 0;
+                    parent_hi = 0;
+                    nwrite = llama_state_seq_save_file(ctx, tmp.c_str(), slot.id, snap_toks.data(), snap_toks.size());
+                    if (nwrite == 0) {
+                        std::filesystem::remove(tmp, ec);
+                        SLT_WRN(slot, "%s", "auto-save: state write failed (disk full / I/O error); retrying\n");
+                        std::this_thread::sleep_for(std::chrono::seconds(5));
+                        continue;
+                    }
+                } else {
+                    delta_capable = (nwrite < nwhole) ? delta_cap::yes : delta_cap::no;
+                    SRV_INF("auto disk cache: delta capability probed = %s (range %zu B vs whole %zu B)\n",
+                            delta_capable == delta_cap::yes ? "YES" : "NO (whole roots only)", nwrite, nwhole);
+                    if (delta_capable == delta_cap::no) {
+                        std::error_code ec; std::filesystem::remove(tmp, ec);
+                        return; // fail closed: this instance only writes whole roots
+                    }
                 }
             }
-        }
-        // 2) regenerate logits sidecar on the temp path (FULL only, and only when the captured
-        //    distribution provably belongs to this exact state — the same stamp check SLOT_SAVE uses).
-        if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL &&
-            slot.logits_last_n_tokens == (int32_t) snap_toks.size() && !slot.logits_last.empty()) {
-            const int nv = llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
-            slot_logits_write(tmp, slot.logits_last, nv, (uint32_t) snap_toks.size());
-        }
-        // 3) meta sidecar on the temp path. Written but renamed LAST. A whole/partial ROOT writes the
-        //    v1 meta (text-only, `media` empty => byte-identical) or the v2 meta (media identity
-        //    records). A DELTA (is_node) passes the FULL `media` records so slot_meta_write's
-        //    (is_node, media-empty) dispatch selects v3 for a text delta (byte-identical) and v4 for a
-        //    media delta; the meta stays WHOLE ([0,N) tokens + full tiling) while the .bin holds only
-        //    cells [lo, N), so restore's byte-verify is the exact v2 path and the .bin composes via NO_CLEAR.
-        const bool meta_ok = is_node
-            ? slot_meta_write(tmp, fp, snap_toks, hash, /*media=*/media, /*is_node=*/true,
-                              parent_id, parent_hi, (uint32_t) snap_toks.size())
-            : slot_meta_write(tmp, fp, snap_toks, hash, media);
-        if (!meta_ok) {
+
+            // P0.4: refuse to publish a snapshot with NO memory payload. llama_kv_cache::state_write and
+            // state_read are SILENT NO-OPS when the cache is a shared view (`if (other) return;`,
+            // src/llama-kv-cache.cpp:2125-2127 / :2204-2206) - as on LLM_ARCH_GEMMA4_ASSISTANT, whose
+            // sub-caches both carry mem_other. llama_state_seq_save_file still returns nwrite > 0 (file
+            // header + token array), so the existing nwrite==0 gate passes, the .meta claims N tokens,
+            // and a later restore loads NOTHING while reporting success. Class-agnostic guard: a real
+            // snapshot must be substantially larger than its own header + token array. (The early return
+            // in the engine is CORRECT for a pure view sharing v_cells_impl - we refuse the empty
+            // SNAPSHOT, never the model.)
+            {
+                const size_t hdr_and_toks = 256 + snap_toks.size() * sizeof(llama_token);
+                if (nwrite <= hdr_and_toks) {
+                    SRV_WRN("auto disk cache: refusing to publish a snapshot with no memory payload "
+                            "(%zu B for %zu tokens) - the memory type serialised nothing\n",
+                            nwrite, snap_toks.size());
+                    std::error_code ec; std::filesystem::remove(tmp, ec);
+                    return;
+                }
+            }
+            // 1b) U6 (mm-delta decision 4): a range-save delta selects suffix cells by POSITION, so a
+            //     mid-chunk anomaly could leave the boundary value right yet silently drop/duplicate suffix
+            //     cells - and restore's byte-verify is NULL-blind. Peek the delta .bin's serialized cell
+            //     count (no multi-GB load) and require it to equal N - parent_hi. On any mismatch do NOT
+            //     persist a corrupt delta: discard and fall back to a WHOLE save of this exact prefix
+            //     (is_node cleared => the meta below is v1/v2 by `media`, byte-identical to a no-parent save).
+            if (is_node) {
+                uint32_t written_cells = 0;
+                const bool ok = delta_bin_cell_count(tmp, snap_toks.size(), written_cells) &&
+                                (size_t) written_cells == snap_toks.size() - parent_hi;
+                if (!ok) {
+                    SLT_WRN(slot, "auto-save: delta cell-count check failed (expected %zu, got %u); "
+                                  "falling back to a whole snapshot\n",
+                            snap_toks.size() - parent_hi, written_cells);
+                    std::error_code ec; std::filesystem::remove(tmp, ec);
+                    is_node   = false;
+                    parent_id = 0;
+                    parent_hi = 0;
+                    nwrite = llama_state_seq_save_file(ctx, tmp.c_str(), slot.id, snap_toks.data(), snap_toks.size());
+                    if (nwrite == 0) {
+                        std::filesystem::remove(tmp, ec);
+                        SLT_WRN(slot, "%s", "auto-save: state write failed (disk full / I/O error); retrying\n");
+                        std::this_thread::sleep_for(std::chrono::seconds(5));
+                        continue;
+                    }
+                }
+            }
+            // 2) regenerate logits sidecar on the temp path (FULL only, and only when the captured
+            //    distribution provably belongs to this exact state - the same stamp check SLOT_SAVE uses).
+            if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL &&
+                slot.logits_last_n_tokens == (int32_t) snap_toks.size() && !slot.logits_last.empty()) {
+                const int nv = llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
+                slot_logits_write(tmp, slot.logits_last, nv, (uint32_t) snap_toks.size());
+            }
+            // 3) meta sidecar on the temp path. Written but renamed LAST. A whole/partial ROOT writes the
+            //    v1 meta (text-only, `media` empty => byte-identical) or the v2 meta (media identity
+            //    records). A DELTA (is_node) passes the FULL `media` records so slot_meta_write's
+            //    (is_node, media-empty) dispatch selects v3 for a text delta (byte-identical) and v4 for a
+            //    media delta; the meta stays WHOLE ([0,N) tokens + full tiling) while the .bin holds only
+            //    cells [lo, N), so restore's byte-verify is the exact v2 path and the .bin composes via NO_CLEAR.
+            const bool meta_ok = is_node
+                ? slot_meta_write(tmp, fp, snap_toks, hash, /*media=*/media, /*is_node=*/true,
+                                  parent_id, parent_hi, (uint32_t) snap_toks.size())
+                : slot_meta_write(tmp, fp, snap_toks, hash, media);
+            if (!meta_ok) {
+                std::error_code ec;
+                std::filesystem::remove(tmp, ec);
+                std::filesystem::remove(slot_logits_sidecar_path(tmp), ec);
+                std::filesystem::remove(slot_meta_sidecar_path(tmp), ec);
+                SLT_WRN(slot, "%s", "auto-save: .meta sidecar write failed (disk full / I/O error); retrying\n");
+                std::this_thread::sleep_for(std::chrono::seconds(5));
+                continue;
+            }
+            // 4) atomic publish: rename state first, then sidecars to their final names. .meta is the
+            //    last to appear, so the startup scan (which keys on .meta) never sees a half-written unit.
             std::error_code ec;
-            std::filesystem::remove(tmp, ec);
-            std::filesystem::remove(slot_logits_sidecar_path(tmp), ec);
-            std::filesystem::remove(slot_meta_sidecar_path(tmp), ec);
-            return; // invariant 4
-        }
-        // 4) atomic publish: rename state first, then sidecars to their final names. .meta is the
-        //    last to appear, so the startup scan (which keys on .meta) never sees a half-written unit.
-        std::error_code ec;
-        std::filesystem::rename(tmp, fname, ec);
-        if (ec) {
-            std::filesystem::remove(tmp, ec);
-            std::filesystem::remove(slot_logits_sidecar_path(tmp), ec);
-            std::filesystem::remove(slot_meta_sidecar_path(tmp), ec);
-            return; // invariant 4
-        }
-        std::filesystem::rename(slot_logits_sidecar_path(tmp), slot_logits_sidecar_path(fname), ec);
-        ec.clear();
-        std::filesystem::rename(slot_meta_sidecar_path(tmp), slot_meta_sidecar_path(fname), ec);
-        // the .meta is the scan key — a unit whose .meta never landed must NOT be
-        // published. If the meta rename failed, the .bin is already in place but unindexable, so we
-        // unlink the orphan .bin (and any leftover temps) and DO NOT insert into the in-memory index.
-        // Leaving the .bin would waste disk and a restart scan would skip it anyway (no .meta).
-        if (ec) {
-            std::error_code rec;
-            std::filesystem::remove(fname, rec);
-            std::filesystem::remove(slot_logits_sidecar_path(fname), rec);
-            std::filesystem::remove(slot_logits_sidecar_path(tmp), rec);
-            std::filesystem::remove(slot_meta_sidecar_path(tmp), rec);
-            return; // invariant 4: don't index a unit whose .meta (the scan key) never published
+            std::filesystem::rename(tmp, fname, ec);
+            if (ec) {
+                std::filesystem::remove(tmp, ec);
+                std::filesystem::remove(slot_logits_sidecar_path(tmp), ec);
+                std::filesystem::remove(slot_meta_sidecar_path(tmp), ec);
+                SLT_WRN(slot, "auto-save: publish rename failed (%s); retrying\n", ec.message().c_str());
+                std::this_thread::sleep_for(std::chrono::seconds(5));
+                continue;
+            }
+            std::filesystem::rename(slot_logits_sidecar_path(tmp), slot_logits_sidecar_path(fname), ec);
+            ec.clear();
+            std::filesystem::rename(slot_meta_sidecar_path(tmp), slot_meta_sidecar_path(fname), ec);
+            // the .meta is the scan key - a unit whose .meta never landed must NOT be
+            // published. If the meta rename failed, the .bin is already in place but unindexable, so we
+            // unlink the orphan .bin (and any leftover temps) and retry the whole save from scratch
+            // instead of returning with nothing persisted.
+            if (ec) {
+                std::error_code rec;
+                std::filesystem::remove(fname, rec);
+                std::filesystem::remove(slot_logits_sidecar_path(fname), rec);
+                std::filesystem::remove(slot_logits_sidecar_path(tmp), rec);
+                std::filesystem::remove(slot_meta_sidecar_path(tmp), rec);
+                SLT_WRN(slot, "auto-save: .meta publish rename failed (%s); retrying\n", ec.message().c_str());
+                std::this_thread::sleep_for(std::chrono::seconds(5));
+                continue;
+            }
+
+            break; // published
         }
 
         if (media.empty()) {
@@ -3642,13 +3730,10 @@ private:
     // LRU bound the only residual (a recurrent mid-generation snapshot a shorter re-request can't
     // rewind into — a safe, evictable write).
     //
-    // Deadline-boxed: each slot's flush is a potentially multi-GB write, and the process is
-    // typically inside a supervisor's stop window (systemd SIGKILLs at TimeoutStopSec) — an
-    // unbounded flush loop trades a clean exit for evictable cache units. The deadline is
-    // checked BETWEEN slots (an in-flight write is never aborted), so the worst case is
-    // deadline + one write; README documents sizing TimeoutStopSec against
-    // slot_save_max_mb x n_slots.
-    static constexpr int64_t AUTO_SAVE_SHUTDOWN_DEADLINE_MS = 60 * 1000;
+    // No deadline by design: a graceful terminate MUST persist every slot. A full disk does not
+    // abandon the flush - auto_publish_snapshot evicts old snapshots and then halts and retries
+    // forever, so a single Ctrl+C keeps trying until the save lands; the only abort is a second
+    // Ctrl+C, which exit()s the process outright from the signal handler.
     void auto_save_slots_at_shutdown() {
         if (!auto_cache_enabled()) {
             return; // off by default
@@ -3656,15 +3741,11 @@ private:
         if (sleeping) {
             return; // sleep entry destroy()'d ctx_tgt; the warm KV is already gone
         }
-        const int64_t t_deadline_ms = ggml_time_ms() + AUTO_SAVE_SHUTDOWN_DEADLINE_MS;
+        SRV_INF("auto-save: flushing %zu slot(s) before shutdown\n", slots.size());
         for (size_t i = 0; i < slots.size(); i++) {
-            if (ggml_time_ms() >= t_deadline_ms) {
-                SRV_WRN("auto-save: shutdown flush deadline (%" PRId64 " ms) exceeded, skipping %zu remaining slots\n",
-                        AUTO_SAVE_SHUTDOWN_DEADLINE_MS, slots.size() - i);
-                break;
-            }
             auto_save_slot_if_useful(slots[i], "shutdown");
         }
+        SRV_INF("%s", "auto-save: shutdown flush complete\n");
     }
 
     // AUTO-SAVE (idle-delay): the two other save sites (get_available_slot reclaim, shutdown) only
