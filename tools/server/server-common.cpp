@@ -1032,10 +1032,11 @@ std::vector<uint64_t> auto_block_hashes(const llama_tokens & cells,
             out.push_back(h);
         }
     }
-    // Degenerate guard: a prompt that still produced no key (e.g. one media chunk shorter than a
+    // Degenerate guard: a MEDIA prompt that still produced no key (e.g. one chunk shorter than a
     // block with nothing after it) must be indexable — emit the full length (a prompt never ends
-    // mid-chunk, so the full length is always chunk-safe).
-    if (out.empty() && !cells.empty() && boundary_is_chunk_safe(cells, media, cells.size())) {
+    // mid-chunk, so the full length is always chunk-safe). Text-only prompts are excluded: the
+    // pre-media algorithm emits no key below one block and the text chain must stay byte-frozen.
+    if (out.empty() && !media.empty() && boundary_is_chunk_safe(cells, media, cells.size())) {
         out.push_back(h);
     }
     return out;
