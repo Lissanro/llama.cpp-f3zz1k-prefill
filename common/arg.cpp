@@ -3582,6 +3582,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--no-slot-save-compact"},
         "for the auto disk cache in whole-snapshot mode (without --slot-save-incremental), delete "
         "shorter exact-prefix auto-cache snapshots after a successful save to reclaim disk space. "
+        "Only effective for dense attention models: FULL/recurrent/hybrid and SWA models cannot "
+        "partially rewind a restore, so their shorter prefixes stay useful and are never compacted. "
         "Manual saves and snapshots that are still parents of a delta chain are never compacted "
         "(default: enabled)",
         [](common_params & params, bool value) {

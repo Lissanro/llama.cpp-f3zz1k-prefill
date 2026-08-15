@@ -2936,17 +2936,27 @@ private:
 
     // Compact shorter exact-prefix auto-cache WHOLE-ROOT snapshots after a whole-root save.
     // Called with auto_idx.mtx held. Only runs when --slot-save-incremental is OFF (whole snapshots
-    // supersede shorter prefixes) and --slot-save-compact is enabled. Only whole-root (full) caches
-    // are ever compacted — delta nodes from a --slot-save-incremental run are never compacted (their
-    // space is reclaimed by the tree-aware LRU). Manual saves are skipped by filename; a whole root
-    // that still has live delta children on disk is protected so compaction never leaves an orphan
-    // delta behind. A candidate is deleted only when its cell tokens (and media records) are an
-    // EXACT prefix of the just-saved snapshot. The new snapshot must already be safely on disk
-    // before this runs to avoid data loss if interrupted during save.
+    // supersede shorter prefixes) and --slot-save-compact is enabled, and only for dense attention
+    // models: FULL/recurrent/hybrid and SWA models cannot partially rewind a restore, so shorter
+    // prefixes stay independently useful there and are never compacted. Only whole-root (full)
+    // caches are ever compacted — delta nodes from a --slot-save-incremental run are never
+    // compacted (their space is reclaimed by the tree-aware LRU). Manual saves are skipped by
+    // filename; a whole root that still has live delta children on disk is protected so
+    // compaction never leaves an orphan delta behind. A candidate is deleted only when its cell
+    // tokens (and media records) are an EXACT prefix of the just-saved snapshot. The new snapshot
+    // must already be safely on disk before this runs to avoid data loss if interrupted during save.
     void auto_compact_after_save_locked(const std::string & new_path,
                                         const llama_tokens & new_toks,
                                         const std::vector<server_media_record> & new_media) {
         if (params_base.slot_save_incremental || !params_base.slot_save_compact || new_toks.empty()) {
+            return;
+        }
+        // FULL/recurrent/hybrid and SWA models cannot partially rewind a restored snapshot
+        // (restore accepts only a whole-snapshot prefix), so a shorter exact-prefix snapshot is
+        // NOT redundant there: it is the only snapshot able to serve a request whose length falls
+        // between the short and the long one. Compacting it would silently delete that mid-range
+        // coverage. Only dense attention models (partial seq_rm, no SWA window) may compact.
+        if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL || n_swa_mem > 0) {
             return;
         }
         // only auto-cache files are candidates; manual filenames are user-owned and never compacted
