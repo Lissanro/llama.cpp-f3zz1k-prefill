@@ -13,6 +13,7 @@ const char * common_speculative_all_types_str();
 
 // parse user provided types
 std::vector<enum common_speculative_type> common_speculative_types_from_names(const std::vector<std::string> & names);
+std::vector<enum common_speculative_type> common_speculative_types_from_gguf(const std::string & path);
 
 // convert string to type
 enum common_speculative_type common_speculative_type_from_name(const std::string & name);
