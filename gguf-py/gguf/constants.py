@@ -5557,6 +5557,7 @@ class VisionProjectorType:
     KIMIVL = "kimivl"
     PADDLEOCR = "paddleocr"
     KIMIK25 = "kimik25"
+    KIMIK3 = "kimik3"
     LIGHTONOCR = "lightonocr"
     COGVLM = "cogvlm"
     JANUS_PRO = "janus_pro"
