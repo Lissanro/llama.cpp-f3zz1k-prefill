@@ -204,6 +204,11 @@ public:
     // returns a pair of pointer to the chunk (nullptr if not found) and its start index in tokens
     std::pair<const mtmd::input_chunk_ptr *, size_t> find_next_media_chunk(size_t idx) const;
 
+    // per-request media signal (the server-wide has_mtmd flag is the wrong granularity
+    // here): true if THIS prompt carries any media chunk; a text-only prompt has an
+    // empty media map.
+    bool has_media() const { return !map_idx_to_media.empty(); }
+
     void push_back(llama_token tok);
 
     // will create a copy of the chunk if it contains non-text data
@@ -238,15 +243,15 @@ public:
 
     llama_tokens get_text_tokens() const;
 
+    std::vector<char> serialize() const;
+    static server_tokens deserialize(const llama_tokens & packed, bool has_mtmd);
+
     // for compatibility with speculative decoding
     void set_token(llama_pos pos, llama_token id);
 
     size_t size() const { return tokens.size(); }
 
     bool empty() const { return tokens.empty(); }
-
-    // true if the sequence actually contains image/audio chunks.
-    bool has_media() const { return !map_idx_to_media.empty(); }
 
     void clear() {
         map_idx_to_media.clear();
@@ -354,7 +359,11 @@ struct model_fp {
     uint32_t fp_cache_k    = 0; // ggml_type of K cache (enum int)
     uint32_t fp_cache_v    = 0; // ggml_type of V cache (enum int)
     uint32_t fp_n_ctx      = 0; // effective per-seq n_ctx
-    uint32_t fp_kv_full    = 0; // 1 if COMMON_CONTEXT_SEQ_RM_TYPE_FULL else 0
+    // 1 if COMMON_CONTEXT_SEQ_RM_TYPE_FULL else 0. Separates FULL from everything else; it does
+    // NOT encode the 4-valued class, so RS and PART share the 0 side. That is sound rather than a
+    // latent collision: an arch in llm_arch_supports_rs_rollback has recurrent memory, so without
+    // MTP it probes as FULL, not PART, and FULL and RS are exactly what this bit does separate.
+    uint32_t fp_kv_full    = 0;
     uint32_t fp_block      = 0; // slot_save_block this snapshot was hashed with
     uint64_t fp_rope_scale = 0; // bit-pattern of effective rope_freq_scale (position-critical)
     // rope_freq_base and ALL YaRN params also bake positions into the saved KV state exactly as
@@ -407,10 +416,54 @@ struct model_fp {
         // the fingerprint-mismatch log for debugging.
     }
 
-    // 64-bit digest of EVERY identity field compared by operator== (fp_n_ctx is EXCLUDED —
-    // see the note above). Used only to name the auto-snapshot files (auto_state_filename):
-    // two peers sharing one --slot-save-path that agree on fp_model but differ in any geometry
-    // field (cache-type, block, rope/YaRN, LoRA, mmproj, ...) would otherwise mint the
+    // Whether a snapshot carrying THIS fingerprint (read from disk) may be
+    // restored into a live context whose fingerprint is `live`.
+    //
+    // Identical to operator== in every field except fp_n_ctx, which is allowed
+    // to be SMALLER on disk when `allow_smaller_ctx`. A conversation that grows
+    // past a context rung migrates to a larger-ctx instance; without this it
+    // can reuse NONE of its own snapshots and pays a full cold prefill
+    // (measured ~197 s at 127k tokens on our rig).
+    //
+    // Safe because the serialised blob has no n_ctx dependence: positions come
+    // entirely from the blob, and n_ctx enters memory construction only as
+    // attn_kv_size = cparams.n_ctx_seq, which sets cells.size() and nothing
+    // else. The one size interaction is already guarded — state_read_data
+    // rejects cell_count > cells.size(), and find_slot rejects
+    // n_tokens > cells.size() — so the REVERSE direction (a large snapshot into
+    // a small context) fails loudly, which matters because routers legitimately
+    // downsize instances when idle.
+    //
+    // operator== stays EXACT on purpose: it is load-bearing for snapshot NAMING
+    // (identity_hash folds fp_n_ctx, so rungs keep disjoint filenames and cannot
+    // atomically rename over one another) and for the incremental-save
+    // parent-find, which must keep delta chains rung-local.
+    //
+    // `allow_smaller_ctx` must be false for iSWA/hybrid-iSWA models: their
+    // classes are unanalysed here, so they stay on exact matching.
+    bool restore_compatible(const model_fp & live, bool allow_smaller_ctx) const {
+        if (fp_n_ctx != live.fp_n_ctx) {
+            if (!allow_smaller_ctx || fp_n_ctx > live.fp_n_ctx) {
+                return false;
+            }
+        }
+        return fp_model == live.fp_model && fp_n_vocab == live.fp_n_vocab &&
+               fp_n_ctx_train == live.fp_n_ctx_train && fp_n_embd == live.fp_n_embd &&
+               fp_n_layer == live.fp_n_layer && fp_rope_type == live.fp_rope_type &&
+               fp_cache_k == live.fp_cache_k && fp_cache_v == live.fp_cache_v &&
+               fp_kv_full == live.fp_kv_full &&
+               fp_block == live.fp_block && fp_rope_scale == live.fp_rope_scale &&
+               fp_rope_base == live.fp_rope_base && fp_yarn_ext == live.fp_yarn_ext &&
+               fp_yarn_attn == live.fp_yarn_attn && fp_yarn_beta_fast == live.fp_yarn_beta_fast &&
+               fp_yarn_beta_slow == live.fp_yarn_beta_slow && fp_yarn_orig_ctx == live.fp_yarn_orig_ctx &&
+               fp_lora == live.fp_lora && fp_mmproj_loaded == live.fp_mmproj_loaded &&
+               fp_mmproj == live.fp_mmproj;
+    }
+
+    // 64-bit digest of EVERY identity field above — the exact set operator== compares.
+    // Used only to name the auto-snapshot files (auto_state_filename): two peers sharing
+    // one --slot-save-path that agree on fp_model but differ in any geometry field
+    // (cache-type, block, rope/YaRN, n_ctx, LoRA, mmproj, ...) would otherwise mint the
     // same filename for the same token prefix and atomically rename over each other; a
     // full-identity prefix gives them disjoint names so both coexist. It is NOT the index
     // key or a restore gate — the block-chain hash keeps its fp_model salt (text-only
@@ -625,6 +678,95 @@ json format_response_rerank(
         bool is_tei_format,
         std::vector<std::string> & texts,
         int top_n);
+
+//
+// stats and metrics
+//
+
+// shared between server_slot and server_task_result_*
+struct server_slot_stats {
+    uint64_t n_prompt_cached    = 0;
+    uint64_t n_prompt_processed = 0;
+    uint64_t n_gen              = 0;
+
+    // speculative decoding stats
+    // note: the per-position breakdown lives in server_slot, it is not needed in a task result
+    uint64_t n_draft_tokens      = 0;
+    uint64_t n_draft_accepted    = 0;
+    uint64_t n_draft_verif_steps = 0;
+
+    // these are absolute timestamps (in us)
+    // note: must be signed - they are subtracted before the later ones are set
+    int64_t t_start       = 0;
+    int64_t t_prompt_last = 0;
+    int64_t t_gen_last    = 0;
+
+    // can only move one direction: start -> prompt -> gen
+    void update_prompt_start() {
+        GGML_ASSERT(t_start == 0);
+        t_start = ggml_time_us();
+    }
+    void set_prompt_last(int64_t t_us) {
+        GGML_ASSERT(t_start > 0);
+        t_prompt_last = t_us;
+    }
+    void update_prompt_last() {
+        set_prompt_last(ggml_time_us());
+    }
+    void update_gen_last() {
+        GGML_ASSERT(t_prompt_last > 0);
+        t_gen_last = ggml_time_us();
+    }
+
+    // these are time durations
+    int64_t t_elapsed_us() const {
+        return ggml_time_us() - t_start;
+    }
+    double t_prompt_ms() const {
+        if (t_prompt_last == 0) {
+            return 0.0; // the prompt is not processed yet
+        }
+        return (t_prompt_last - t_start) / 1000.0;
+    }
+    int64_t t_gen_us() const {
+        if (t_gen_last == 0) {
+            return 0; // the generation is not started yet
+        }
+        // clamp to 1 us, the first token can land in the same us as t_prompt_last
+        return std::max<int64_t>(1, t_gen_last - t_prompt_last);
+    }
+    double t_gen_ms() const {
+        return t_gen_us() / 1000.0;
+    }
+
+    // number of decode steps spent on generation
+    // the first token is free, it comes from the logits of the last prompt batch
+    uint64_t n_gen_steps() const {
+        return n_gen > 0 ? n_gen - 1 : 0;
+    }
+
+    // other derived metrics
+    // note: all of them return 0.0 if the divisor is not known yet
+    double t_prompt_per_token_ms() const {
+        return n_prompt_processed > 0 ? t_prompt_ms() / n_prompt_processed : 0.0;
+    }
+    double t_gen_per_token_ms() const {
+        return n_gen_steps() > 0 ? t_gen_ms() / n_gen_steps() : 0.0;
+    }
+    double n_prompt_tps() const {
+        const double t_ms = t_prompt_ms();
+        return t_ms > 0.0 ? 1e3 / t_ms * n_prompt_processed : 0.0;
+    }
+    double n_gen_tps() const {
+        const double t_ms = t_gen_ms();
+        return t_ms > 0.0 ? 1e3 / t_ms * n_gen_steps() : 0.0;
+    }
+
+    // false if the slot never started, i.e. the task result carries no stats
+    bool is_set() const {
+        return t_start > 0;
+    }
+};
 
 //
 // other utils
