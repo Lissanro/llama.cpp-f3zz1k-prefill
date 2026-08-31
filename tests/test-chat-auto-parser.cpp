@@ -2120,7 +2120,7 @@ static void test_standard_json_tools_openai(testing & t) {
     }
 
     common_chat_msg msg;
-    auto mapper = common_chat_peg_mapper(msg);
+    auto mapper = common_chat_peg_mapper(msg, input);
     mapper.from_ast(ctx.ast, result);
 
     t.assert_equal("tool calls count", 1u, msg.tool_calls.size());
@@ -2166,7 +2166,7 @@ static void test_standard_json_tools_cohere(testing & t) {
     }
 
     common_chat_msg msg;
-    auto mapper = common_chat_peg_mapper(msg);
+    auto mapper = common_chat_peg_mapper(msg, input);
     mapper.from_ast(ctx.ast, result);
 
     t.assert_equal("tool calls count", 1u, msg.tool_calls.size());
@@ -2212,7 +2212,7 @@ static void test_standard_json_tools_function_key(testing & t) {
     }
 
     common_chat_msg msg;
-    auto mapper = common_chat_peg_mapper(msg);
+    auto mapper = common_chat_peg_mapper(msg, input);
     mapper.from_ast(ctx.ast, result);
 
     t.assert_equal("tool calls count", 1u, msg.tool_calls.size());
@@ -2672,7 +2672,7 @@ static void test_tagged_args_with_embedded_quotes(testing & t) {
     }
 
     common_chat_msg msg;
-    auto mapper = common_chat_peg_mapper(msg);
+    auto mapper = common_chat_peg_mapper(msg, input);
     mapper.from_ast(ctx.ast, result);
 
     t.assert_equal("tool calls count", 1u, msg.tool_calls.size());

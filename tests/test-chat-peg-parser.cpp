@@ -378,7 +378,7 @@ static void test_example_native(testing & t) {
             t.assert_true("success", result.success());
 
             common_chat_msg msg;
-            auto            mapper = common_chat_peg_mapper(msg);
+            auto            mapper = common_chat_peg_mapper(msg, effective_input);
             mapper.from_ast(ctx.ast, result);
 
             t.assert_equal("content equal", tc.expect_content, msg.content);
@@ -477,7 +477,7 @@ static void test_example_qwen3_coder(testing & t) {
             }
 
             common_chat_msg msg;
-            auto            mapper = common_chat_peg_mapper(msg);
+            auto            mapper = common_chat_peg_mapper(msg, in);
             mapper.from_ast(ctx.ast, result);
 
             //t.log("Input: " + input);
@@ -540,7 +540,7 @@ static void test_example_qwen3_non_coder(testing & t) {
         t.assert_true("success", result.success());
 
         common_chat_msg msg;
-        auto            mapper = common_chat_peg_mapper(msg);
+        auto            mapper = common_chat_peg_mapper(msg, input);
         mapper.from_ast(ctx.ast, result);
 
         t.assert_equal("content", "I need to get the weather.\n", msg.content);
@@ -575,7 +575,7 @@ static void test_example_qwen3_non_coder(testing & t) {
             }
 
             common_chat_msg msg;
-            auto            mapper = common_chat_peg_mapper(msg);
+            auto            mapper = common_chat_peg_mapper(msg, in);
             mapper.from_ast(ctx.ast, result);
 
             //t.log("Input: " + input);
@@ -632,7 +632,7 @@ void test_command7_parser_compare(testing & t) {
         auto                     result = p.parse(ctx);
 
         common_chat_msg msg;
-        auto            mapper = common_chat_peg_mapper(msg);
+        auto            mapper = common_chat_peg_mapper(msg, input);
         mapper.from_ast(ctx.ast, result);
 
         if (print_results) {
@@ -797,7 +797,7 @@ static void test_prefix_tool_names(testing & t) {
         t.assert_true("success", result.success());
 
         common_chat_msg msg;
-        auto            mapper = common_chat_peg_mapper(msg);
+        auto            mapper = common_chat_peg_mapper(msg, input);
         mapper.from_ast(ctx.ast, result);
 
         t.assert_equal("content", "Let me call the function.", msg.content);
@@ -834,7 +834,7 @@ static void test_prefix_tool_names(testing & t) {
             }
 
             common_chat_msg msg;
-            auto            mapper = common_chat_peg_mapper(msg);
+            auto            mapper = common_chat_peg_mapper(msg, in);
             mapper.from_ast(ctx.ast, result);
 
             // The critical check: during incremental parsing, we should never
@@ -881,7 +881,7 @@ static void test_prefix_tool_names(testing & t) {
         t.assert_true("success", result.success());
 
         common_chat_msg msg;
-        auto            mapper = common_chat_peg_mapper(msg);
+        auto            mapper = common_chat_peg_mapper(msg, input);
         mapper.from_ast(ctx.ast, result);
 
         t.assert_equal("content", "Let me call the function.", msg.content);
